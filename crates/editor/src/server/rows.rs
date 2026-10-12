@@ -2,8 +2,9 @@
 //! and how to take them back, for the client tables whose rows the server
 //! reads from its own SQL tables. [`MAPPED`] lists them: `Spell.dbc` becomes
 //! `spell_template`, `TaxiNodes.dbc` becomes `taxi_nodes`,
-//! `SkillLineAbility.dbc` becomes `skill_line_ability`, and `AreaTable.dbc`
-//! becomes `area_template`.
+//! `SkillLineAbility.dbc` becomes `skill_line_ability`, `AreaTable.dbc`
+//! becomes `area_template`, and `AreaTrigger.dbc` becomes
+//! `areatrigger_template`.
 //!
 //! ## The file is rewritten whole on every save
 //!
@@ -54,9 +55,11 @@
 //! is a `skill_line_ability` row at build 5875 with no lower build behind
 //! it, since the loader reads that build alone, so its undo is a `DELETE`
 //! only for a row this project added. An area is an `area_template` row
-//! keyed by its entry alone, with no build, on the same terms. See [`Undo`],
-//! and `vale_mangos::spell::undo`, `vale_mangos::taxi::undo`,
-//! `vale_mangos::skills::undo` and `vale_mangos::area::undo`, which hold the
+//! keyed by its entry alone, with no build, on the same terms. An area trigger
+//! is an `areatrigger_template` dev row at build 5875, on the flight node's
+//! terms. See [`Undo`], and `vale_mangos::spell::undo`,
+//! `vale_mangos::taxi::undo`, `vale_mangos::skills::undo`,
+//! `vale_mangos::area::undo` and `vale_mangos::trigger::undo`, which hold the
 //! rule.
 //!
 //! There is no permanent apply. The durable output is the SQL file in the
@@ -83,6 +86,7 @@ use vale_mangos::area;
 use vale_mangos::skills;
 use vale_mangos::spell::{self, Assignment};
 use vale_mangos::taxi;
+use vale_mangos::trigger;
 use bevy::prelude::*;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -99,16 +103,17 @@ pub const REVERT_VPATH: &str = "sql\\revert.sql";
 ///
 /// Every other DBC the server reads, it reads as a file in `DataDir\5875\dbc\`, and
 /// a publish copies it there; see `super::release::copy_server_dbcs`.
-pub const MAPPED: [(&str, &str); 4] = [
+pub const MAPPED: [(&str, &str); 5] = [
     ("Spell", spell::TABLE),
     ("TaxiNodes", taxi::TABLE),
     ("SkillLineAbility", skills::TABLE),
     ("AreaTable", area::TABLE),
+    ("AreaTrigger", trigger::TEMPLATE),
 ];
 
 /// Whether the server has a `.reload` for a mapped table. `spell_template` has
-/// one; `taxi_nodes`, `skill_line_ability` and `area_template` are read once
-/// at startup and have none.
+/// one; `taxi_nodes`, `skill_line_ability`, `area_template` and
+/// `areatrigger_template` are read once at startup and have none.
 pub fn reloadable(table: &str) -> bool {
     table == spell::TABLE
 }
@@ -117,23 +122,28 @@ pub fn reloadable(table: &str) -> bool {
 pub fn refusal(dbc: &str, id: u32) -> String {
     match dbc {
         "TaxiNodes" => format!(
-            "flight node {id} cannot go to the server: node ids stop at {}",
+            "flight node {id} cannot be written to the server: the highest taxi_nodes id is {}",
             taxi::MAX_ID
         ),
         "SkillLineAbility" => format!(
-            "skill line ability {id} cannot go to the server: its id and its two spells \
+            "skill line ability {id} cannot be written to the server: its id and its two spells \
              must each be at most {}, since skill_line_ability holds them as smallints",
             skills::MAX_SMALLINT
         ),
         "AreaTable" => format!(
-            "area {id} cannot go to the server: its explore bit must be under {}, its \
+            "area {id} cannot be written to the server: its explore bit must be under {}, its \
              name at most {} bytes, and its team and liquid type at most {}",
             area::EXPLORE_BITS,
             area::MAX_NAME,
             area::MAX_TINYINT
         ),
+        "AreaTrigger" => format!(
+            "area trigger {id} cannot be written to the server: the highest trigger id is {}, since \
+             areatrigger_template.id is a smallint",
+            trigger::MAX_ID
+        ),
         _ => format!(
-            "spell {id} cannot go to the server: ids above {} do not fit \
+            "spell {id} cannot be written to the server: ids above {} do not fit \
              spell_template.entry, which is a smallint",
             spell::MAX_ENTRY
         ),
@@ -249,7 +259,7 @@ impl Plan {
     /// One line for the status bar.
     pub fn line(&self) -> String {
         if self.nothing() {
-            return "nothing for the server".to_string();
+            return "no server rows changed".to_string();
         }
         match self.reaches_the_server() {
             true => format!(
@@ -260,7 +270,7 @@ impl Plan {
             // Stated in words, because a count alone would read as a change
             // that reached the server.
             false => format!(
-                "{} row(s) — none of it is a column the server reads",
+                "{} row(s) — the server reads none of the changed columns",
                 self.rows.len()
             ),
         }
@@ -302,13 +312,13 @@ pub fn save(
         Ok(plan) => plan,
         Err(e) => {
             warn!("server: {e}");
-            session.status = format!("saved, but the server's half did not: {e}");
+            session.status = format!("saved, but the server rows could not be built: {e}");
             return None;
         }
     };
     if let Err(e) = write_file(session, &plan) {
         warn!("server: {e}");
-        session.status = format!("saved, but {VPATH} did not: {e}");
+        session.status = format!("saved, but {VPATH} was not written: {e}");
         return None;
     }
     // Reported whether or not anything else happens: a refused row is a change
@@ -344,7 +354,7 @@ pub fn save(
     }
     if !server.apply_on_save {
         info!("server: {} into {VPATH}, not applied", plan.line());
-        session.status = format!("{} into {VPATH} — applying is off", plan.line());
+        session.status = format!("{} written to {VPATH}, not applied: Apply on save is off", plan.line());
         return None;
     }
     // Skip the apply when the database already holds this plan.
@@ -379,7 +389,7 @@ pub fn save(
 fn line_for(plan: &Plan, applied: &Applied) -> String {
     let undo = match applied.newly_undoable {
         0 => String::new(),
-        n => format!(", {n} newly undoable"),
+        n => format!(", {n} added to the revert file"),
     };
     let restart = match plan.read_at_startup().as_slice() {
         [] => String::new(),
@@ -396,7 +406,7 @@ fn line_for(plan: &Plan, applied: &Applied) -> String {
             applied.rows, applied.affected
         ),
         false => format!(
-            "{} row(s) applied{undo} — none of it is a column the server reads",
+            "{} row(s) applied{undo} — the server reads none of the changed columns",
             applied.rows
         ),
     }
@@ -462,6 +472,37 @@ pub fn plan(session: &EditSession, assets: &GameAssets) -> Result<Plan, String> 
                         table: server_table,
                         key: taxi::key(entry),
                         statements: taxi::statements(was, &node),
+                        changes,
+                    });
+                }
+            }
+            "AreaTrigger" => {
+                use vale_edit::dbc::places;
+                let before: HashMap<u32, places::Trigger> = places::triggers(&shipped)
+                    .into_iter()
+                    .map(|trigger| (trigger.id, trigger))
+                    .collect();
+                for entry in changed_entries(&shipped, &edited) {
+                    let Some(volume) = edited
+                        .row_of(entry)
+                        .and_then(|record| places::trigger_at(&edited, record))
+                    else {
+                        continue;
+                    };
+                    let was = before.get(&entry);
+                    let changes = trigger::changes(was, &volume);
+                    if changes.is_empty() {
+                        continue;
+                    }
+                    if !trigger::fits(entry) {
+                        out.refused.push((table, entry));
+                        continue;
+                    }
+                    any = true;
+                    out.rows.push(Row {
+                        table: server_table,
+                        key: trigger::key(entry),
+                        statements: trigger::statements(was, &volume),
                         changes,
                     });
                 }
@@ -541,7 +582,7 @@ pub fn plan(session: &EditSession, assets: &GameAssets) -> Result<Plan, String> 
 /// empty.
 pub fn write_file(session: &EditSession, plan: &Plan) -> Result<Option<PathBuf>, String> {
     let Some(disk) = session.project.path_for(VPATH) else {
-        return Err(format!("{VPATH} leaves the project"));
+        return Err(format!("{VPATH}: path is outside the project folder"));
     };
     if plan.nothing() {
         // A project with every edit undone removes its file. Leaving the last
@@ -623,7 +664,7 @@ pub fn apply_at(
             .map(|(_, _, sql)| sql.clone())
             .collect();
         db.run(&back).map_err(|e| {
-            format!("putting back what this project applied before did not finish: {e}")
+            format!("could not restore the rows this project applied earlier: {e}")
         })?;
         forget_revert_file(project)?;
     }
@@ -653,6 +694,10 @@ pub fn apply_at(
             area::TABLE => {
                 let now = db.row(&area::dev_row_query(entry))?;
                 area::undo(entry, &row.changes, now.as_ref())
+            }
+            trigger::TEMPLATE => {
+                let now = db.row(&trigger::dev_row_query(entry))?;
+                trigger::undo(entry, &row.changes, now.as_ref())
             }
             _ => {
                 let now = db.row(&spell::dev_row_query(entry))?;
@@ -725,7 +770,7 @@ fn forget_revert_file(project: &vale_edit::project::Project) -> Result<(), Strin
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!(
-            "{REVERT_VPATH} has been put back but could not be removed: {e}. Remove it by \
+            "{REVERT_VPATH} has been run but could not be removed: {e}. Remove it by \
              hand before the next Apply."
         )),
     }
@@ -783,7 +828,7 @@ pub fn apply_work(
                     // change and can be applied later.
                     Err(e) => {
                         warn!("server: {e}");
-                        format!("{} into {VPATH}, not applied: {e}", plan.line())
+                        format!("{} written to {VPATH}, not applied: {e}", plan.line())
                     }
                 };
             },
@@ -852,12 +897,12 @@ impl Reverted {
     /// One line for the status bar: what was put back, and which removals
     /// still need a server restart.
     pub fn line(&self) -> String {
-        let put_back = format!("put back {} row(s), {} affected", self.rows, self.affected);
+        let put_back = format!("restored {} row(s), {} affected", self.rows, self.affected);
         match self.removals {
             0 => put_back,
             n => format!(
-                "{put_back} \u{2014} {n} of them removed a row, which a reload cannot undo: \
-                 the server keeps it until it restarts"
+                "{put_back} \u{2014} {n} of them deleted a row, which a reload does not remove: \
+                 the server keeps the row in memory until it restarts"
             ),
         }
     }
@@ -964,10 +1009,10 @@ impl Undo {
             return Ok(());
         }
         let mut body = format!(
-            "-- {} — how to put the server back.\n\
-             -- Written before each apply, and only for rows it had not already\n\
-             -- covered, so running this returns them to what they were before\n\
-             -- this project first touched them. Plain SQL: it can be run by hand.\n\n",
+            "-- {} — statements that put the server back.\n\
+             -- Written before each apply, only for rows not already listed, so\n\
+             -- running this restores each row to its values before this project\n\
+             -- first changed it. Plain SQL: it can be run by hand.\n\n",
             project.name
         );
         for (table, key, statement) in &self.entries {
@@ -1004,7 +1049,7 @@ pub fn on_the_command_line(
     match revert(&mut session, &server) {
         Ok(done) if done.rows == 0 => {
             info!("--revert: this project has applied nothing");
-            session.status = "nothing to put back".into();
+            session.status = "nothing to restore".into();
         }
         Ok(done) => {
             info!("--revert: {}", done.line());

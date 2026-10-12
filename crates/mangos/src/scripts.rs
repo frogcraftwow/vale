@@ -22,7 +22,7 @@
 //! areatrigger_scripts         an AreaTrigger.dbc id
 //! ```
 //!
-//! ## A script is written whole
+//! ## Why a script is written as a whole
 //!
 //! None of the tables has a primary key. A row is identified by nothing but
 //! its content, and four of its columns are floats, so no `WHERE` clause this
@@ -30,7 +30,8 @@
 //! the unit of edit, as a waypoint path is (see [`crate::path`]): every row
 //! under an `id` is deleted and the rows the project holds are inserted, in
 //! `(delay, priority)` order. The undo is the rows that were there, restored
-//! the same way. [`Scripts`] is the store, on [`crate::path::Paths`]' shape.
+//! the same way. [`Scripts`] is the store; it has the same shape as
+//! [`crate::path::Paths`].
 //!
 //! ## What a row is
 //!
@@ -50,7 +51,7 @@
 //! (`ScriptMgr.cpp:1631`); [`waits`] says which tables take one. An event
 //! that waits starts a `generic_scripts` script, whose rows do.
 //!
-//! ## Live on a reload
+//! ## Which tables a `.reload` re-reads
 //!
 //! `.reload creature_ai_events` re-reads `creature_ai_scripts` first and says
 //! so; `gossip_scripts`, `generic_scripts`, `event_scripts`,
@@ -341,8 +342,8 @@ const fn c(
 /// The 94 commands, in `ScriptCommands.h:37`'s order. A command not in the
 /// table is drawn by its number with every column offered.
 pub const COMMANDS: [Command; 94] = [
-    c(0, "Talk", "WorldObject", [p("chat_type", Kind::Choice(&CHAT_TYPES), "how it is said"), None, None, None], [p("broadcast_text", Kind::Ref("broadcast_text"), "what is said"), p("broadcast_text 2", Kind::Ref("broadcast_text"), "a second text, chosen at random"), p("broadcast_text 3", Kind::Ref("broadcast_text"), "a third"), p("broadcast_text 4", Kind::Ref("broadcast_text"), "a fourth")], false, true),
-    c(1, "Emote", "Unit", [p("emote", Kind::Ref("Emotes"), "Emotes.dbc id"), p("emote 2", Kind::Ref("Emotes"), "a second, chosen at random"), p("emote 3", Kind::Ref("Emotes"), "a third"), p("emote 4", Kind::Ref("Emotes"), "a fourth")], [yes("is_targeted", "face the target while emoting"), None, None, None], false, true),
+    c(0, "Talk", "WorldObject", [p("chat_type", Kind::Choice(&CHAT_TYPES), "how it is said"), None, None, None], [p("broadcast_text", Kind::Ref("broadcast_text"), "the text that is said"), p("broadcast_text 2", Kind::Ref("broadcast_text"), "a second text, chosen at random"), p("broadcast_text 3", Kind::Ref("broadcast_text"), "a third text, chosen at random"), p("broadcast_text 4", Kind::Ref("broadcast_text"), "a fourth text, chosen at random")], false, true),
+    c(1, "Emote", "Unit", [p("emote", Kind::Ref("Emotes"), "Emotes.dbc id"), p("emote 2", Kind::Ref("Emotes"), "a second emote, chosen at random"), p("emote 3", Kind::Ref("Emotes"), "a third emote, chosen at random"), p("emote 4", Kind::Ref("Emotes"), "a fourth emote, chosen at random")], [yes("is_targeted", "face the target while emoting"), None, None, None], false, true),
     c(2, "Set field", "Object", [n("field_id", "an update field index"), n("value", ""), None, None], NONE, false, false),
     c(3, "Move to", "Creature", [p("coordinates_type", Kind::Choice(&MOVE_TO_COORDINATES), "how x, y, z and o are read"), n("time", "milliseconds to take, or 0 for the creature's speed"), n("movement_options", "MoveOptions"), n("flags", "eMoveToFlags: 1 forced, 2 point movement generator")], [n("path_id", "creature_movement_special path"), None, None, None], true, true),
     c(4, "Modify flags", "Object", [n("field_id", "an update field index"), n("bitmask", ""), n("options", "eModifyFlagsOptions: 0 set, 1 remove, 2 toggle"), None], NONE, false, false),
@@ -363,9 +364,9 @@ pub const COMMANDS: [Command; 94] = [
     c(19, "Set equipment", "Creature", [yes("reset_default", "back to the template's equipment"), None, None, None], [p("main hand", Kind::Ref("item_template"), ""), p("off hand", Kind::Ref("item_template"), ""), p("ranged", Kind::Ref("item_template"), ""), None], false, false),
     c(20, "Movement", "Creature", [n("movement_type", "MovementGeneratorType: 0 idle, 1 random, 2 waypoint, 3 confused, 4 chase, 5 home, 6 flight, 7 point, 8 fleeing, 9 distract, 10 assistance, 11 timed flee, 12 follow, 13 effect, 14 patrol, 15 charge, 16 distancing"), n("bool_param", "meaning depends on the type"), n("int_param", "meaning depends on the type"), yes("clear", "clear the movement stack first")], NONE, true, true),
     c(21, "Set active object", "Creature", [yes("active", "updated whether or not a player is near"), None, None, None], NONE, false, false),
-    c(22, "Set faction", "Creature", [p("faction_id", Kind::Ref("FactionTemplate"), "0 restores the template's"), n("flags", "TemporaryFactionFlags"), None, None], NONE, false, false),
-    c(23, "Morph to entry or model", "Unit", [n("creature_id or display_id", "which one datalong2 says"), yes("is_display_id", ""), None, None], NONE, false, false),
-    c(24, "Mount to entry or model", "Creature", [n("creature_id or display_id", "which one datalong2 says"), yes("is_display_id", ""), yes("permanent", ""), None], NONE, false, false),
+    c(22, "Set faction", "Creature", [p("faction_id", Kind::Ref("FactionTemplate"), "0 restores the template's faction"), n("flags", "TemporaryFactionFlags"), None, None], NONE, false, false),
+    c(23, "Morph to entry or model", "Unit", [n("creature_id or display_id", "datalong2 decides which one"), yes("is_display_id", ""), None, None], NONE, false, false),
+    c(24, "Mount to entry or model", "Creature", [n("creature_id or display_id", "datalong2 decides which one"), yes("is_display_id", ""), yes("permanent", ""), None], NONE, false, false),
     c(25, "Set run", "Creature", [yes("run", ""), None, None, None], NONE, false, false),
     c(26, "Attack start", "Creature", NONE, NONE, false, true),
     c(27, "Update entry", "Creature", [p("creature_entry", Kind::Ref("creature_template"), ""), None, None, None], NONE, false, false),
@@ -373,44 +374,44 @@ pub const COMMANDS: [Command; 94] = [
     c(29, "Modify threat", "Creature", [n("targets", "eModifyThreatTargets, or a ScriptTarget"), None, None, None], NONE, true, true),
     c(30, "Send taxi path", "Player", [p("taxi_path_id", Kind::Ref("TaxiPath"), ""), None, None, None], NONE, false, false),
     c(31, "Terminate script", "Any", [p("creature_entry", Kind::Ref("creature_template"), "0 for no search"), n("search_distance", ""), n("options", "eTerminateScriptOptions: 0 if found, 1 if not found"), None], NONE, false, false),
-    c(32, "Terminate on condition", "Any", [n("condition_id", "a row of conditions"), p("failed_quest_id", Kind::Ref("quest_template"), "failed when the script ends here"), n("flags", "1 terminate when the condition is false"), None], NONE, false, false),
+    c(32, "Terminate on condition", "Any", [p("condition_id", Kind::Ref(crate::condition::TABLE), "a conditions entry"), p("failed_quest_id", Kind::Ref("quest_template"), "failed when the script ends here"), n("flags", "1 terminate when the condition is false"), None], NONE, false, false),
     c(33, "Enter evade mode", "Creature", NONE, NONE, false, false),
     c(34, "Set home position", "Creature", [n("options", "eSetHomePositionOptions: 0 the coordinates, 1 the current position, 2 the default position, 3 the target's position"), None, None, None], NONE, true, true),
     c(35, "Turn to", "Unit", [n("options", "eTurnToFacingOptions: 0 the target, 1 the o given"), None, None, None], NONE, true, true),
     c(36, "Meeting stone", "Player", [p("area_id", Kind::Ref("AreaTable"), ""), None, None, None], NONE, false, false),
     c(37, "Set instance data", "Map", [n("field", ""), n("data", ""), n("options", "eSetInstDataOptions: 0 set, 1 increment, 2 decrement"), None], NONE, false, false),
     c(38, "Set instance data 64", "Map", [n("field", ""), n("data", ""), n("options", "eSetInstData64Options: 0 the data, 1 the target's guid"), None], NONE, false, true),
-    c(39, "Start script", "Map", [p("generic_script_id", Kind::Ref(GENERIC), ""), p("generic_script_id 2", Kind::Ref(GENERIC), ""), p("generic_script_id 3", Kind::Ref(GENERIC), ""), p("generic_script_id 4", Kind::Ref(GENERIC), "")], [n("chance", "of the first, in percent"), n("chance 2", ""), n("chance 3", ""), n("chance 4", "the four together at most 100")], false, true),
+    c(39, "Start script", "Map", [p("generic_script_id", Kind::Ref(GENERIC), ""), p("generic_script_id 2", Kind::Ref(GENERIC), ""), p("generic_script_id 3", Kind::Ref(GENERIC), ""), p("generic_script_id 4", Kind::Ref(GENERIC), "")], [n("chance", "chance of the first, in percent"), n("chance 2", ""), n("chance 3", ""), n("chance 4", "chance of the fourth; the four together at most 100")], false, true),
     c(40, "Remove item", "Player", [p("item_id", Kind::Ref("item_template"), ""), n("amount", ""), None, None], NONE, false, true),
     c(41, "Remove object", "GameObject or Creature", NONE, NONE, false, false),
     c(42, "Set melee attack", "Creature", [yes("on", ""), None, None, None], NONE, false, false),
     c(43, "Set combat movement", "Creature", [yes("on", ""), None, None, None], NONE, false, false),
     c(44, "Set phase", "Creature", [n("phase", "0 to 31"), n("options", "eSetPhaseOptions: 0 set, 1 increment, 2 decrement"), None, None], NONE, false, false),
-    c(45, "Set random phase", "Creature", [n("phase", ""), n("phase 2", ""), n("phase 3", ""), n("phase 4", "one of the four, at random")], NONE, false, false),
+    c(45, "Set random phase", "Creature", [n("phase", ""), n("phase 2", ""), n("phase 3", ""), n("phase 4", "one of the four phases is set, at random")], NONE, false, false),
     c(46, "Set phase in range", "Creature", [n("phase_min", ""), n("phase_max", ""), None, None], NONE, false, false),
     c(47, "Flee", "Creature", [yes("seek_assistance", ""), None, None, None], NONE, false, false),
-    c(48, "Deal damage", "Unit", [n("damage", ""), yes("is_percent", "of the target's health"), None, None], NONE, false, true),
+    c(48, "Deal damage", "Unit", [n("damage", ""), yes("is_percent", "damage is a percent of the target's health"), None, None], NONE, false, true),
     c(49, "Zone combat pulse", "Creature", [yes("initial_pulse", ""), None, None, None], NONE, false, false),
     c(50, "Call for help", "Creature", NONE, NONE, true, false),
     c(51, "Set sheath", "Unit", [p("sheath", Kind::Choice(&SHEATH_STATES), ""), None, None, None], NONE, false, false),
     c(52, "Invincibility", "Creature", [n("health", "the health it cannot drop below; 0 turns it off"), yes("is_percent", ""), None, None], NONE, false, false),
     c(53, "Game event", "None", [n("event_id", "game_event entry"), yes("start", "1 start, 0 stop"), yes("overwrite", ""), None], NONE, false, false),
     c(54, "Set server variable", "None", [n("index", ""), n("value", ""), None, None], NONE, false, false),
-    c(55, "Creature spells", "Creature", [p("creature_spells id", Kind::Ref("creature_spells"), ""), p("creature_spells id 2", Kind::Ref("creature_spells"), ""), p("creature_spells id 3", Kind::Ref("creature_spells"), ""), p("creature_spells id 4", Kind::Ref("creature_spells"), "")], [n("chance", "of the first, in percent"), n("chance 2", ""), n("chance 3", ""), n("chance 4", "the four together at most 100")], false, false),
+    c(55, "Creature spells", "Creature", [p("creature_spells id", Kind::Ref("creature_spells"), ""), p("creature_spells id 2", Kind::Ref("creature_spells"), ""), p("creature_spells id 3", Kind::Ref("creature_spells"), ""), p("creature_spells id 4", Kind::Ref("creature_spells"), "")], [n("chance", "chance of the first, in percent"), n("chance 2", ""), n("chance 3", ""), n("chance 4", "chance of the fourth; the four together at most 100")], false, false),
     c(56, "Remove guardians", "Unit", [p("creature_id", Kind::Ref("creature_template"), "0 for all"), None, None, None], NONE, false, false),
     c(57, "Add spell cooldown", "Unit", [p("spell_id", Kind::Ref("Spell"), ""), n("cooldown", "seconds"), None, None], NONE, false, false),
     c(58, "Remove spell cooldown", "Unit", [p("spell_id", Kind::Ref("Spell"), "0 for all"), None, None, None], NONE, false, false),
     c(59, "Set react state", "Creature", [p("react_state", Kind::Choice(&REACT_STATES), ""), None, None, None], NONE, false, false),
     c(60, "Start waypoints", "Creature", [n("waypoints_source", "0 creature_movement, 1 creature_movement_template, 2 creature_movement_special"), n("start_point", ""), n("initial_delay", "milliseconds"), yes("repeat", "")], [n("overwrite_guid", "read the path of this spawn instead"), p("overwrite_entry", Kind::Ref("creature_template"), "read the template path of this creature instead"), None, None], false, false),
-    c(61, "Start map event", "Map", [n("event_id", ""), n("time_limit", "milliseconds"), None, None], [n("success_condition", ""), p("success_script", Kind::Ref(GENERIC), ""), n("failure_condition", ""), p("failure_script", Kind::Ref(GENERIC), "")], false, false),
+    c(61, "Start map event", "Map", [n("event_id", ""), n("time_limit", "milliseconds"), None, None], [p("success_condition", Kind::Ref(crate::condition::TABLE), "the event succeeds when it holds"), p("success_script", Kind::Ref(GENERIC), ""), p("failure_condition", Kind::Ref(crate::condition::TABLE), "the event fails when it holds"), p("failure_script", Kind::Ref(GENERIC), "")], false, false),
     c(62, "End map event", "Map", [n("event_id", ""), yes("success", ""), None, None], NONE, false, false),
-    c(63, "Add map event target", "Map", [n("event_id", ""), None, None, None], [n("success_condition", ""), p("success_script", Kind::Ref(GENERIC), ""), n("failure_condition", ""), p("failure_script", Kind::Ref(GENERIC), "")], false, true),
-    c(64, "Remove map event target", "Map", [n("event_id", ""), n("condition_id", ""), n("options", "eRemoveMapEventTargetOptions"), None], NONE, false, true),
+    c(63, "Add map event target", "Map", [n("event_id", ""), None, None, None], [p("success_condition", Kind::Ref(crate::condition::TABLE), "the event succeeds when it holds"), p("success_script", Kind::Ref(GENERIC), ""), p("failure_condition", Kind::Ref(crate::condition::TABLE), "the event fails when it holds"), p("failure_script", Kind::Ref(GENERIC), "")], false, true),
+    c(64, "Remove map event target", "Map", [n("event_id", ""), p("condition_id", Kind::Ref(crate::condition::TABLE), "with options 1 or 2, the targets that meet it are removed"), n("options", "eRemoveMapEventTargetOptions"), None], NONE, false, true),
     c(65, "Set map event data", "Map", [n("event_id", ""), n("index", ""), n("data", ""), n("options", "eSetMapScriptDataOptions: 0 set, 1 increment, 2 decrement")], NONE, false, false),
     c(66, "Send map event", "Map", [n("event_id", ""), n("data", ""), n("options", "eSendMapEventOptions"), None], NONE, false, false),
     c(67, "Set default movement", "Creature", [n("movement_type", "0 idle, 1 random, 2 waypoint"), yes("always_replace", ""), n("param1", "wander distance for random"), None], NONE, false, false),
     c(68, "Start script for all", "WorldObject", [p("generic_script_id", Kind::Ref(GENERIC), ""), n("options", "eStartScriptForAllOptions: 0 game objects, 1 creatures, 2 players, 3 units, 4 world objects"), n("object_entry", "or 0 for any"), n("search_radius", "")], NONE, false, false),
-    c(69, "Edit map event", "Map", [n("event_id", ""), None, None, None], [n("success_condition", ""), p("success_script", Kind::Ref(GENERIC), ""), n("failure_condition", ""), p("failure_script", Kind::Ref(GENERIC), "")], false, false),
+    c(69, "Edit map event", "Map", [n("event_id", ""), None, None, None], [p("success_condition", Kind::Ref(crate::condition::TABLE), "the event succeeds when it holds"), p("success_script", Kind::Ref(GENERIC), ""), p("failure_condition", Kind::Ref(crate::condition::TABLE), "the event fails when it holds"), p("failure_script", Kind::Ref(GENERIC), "")], false, false),
     c(70, "Fail quest", "Player", [p("quest_id", Kind::Ref("quest_template"), ""), None, None, None], NONE, false, false),
     c(71, "Respawn creature", "Creature", [yes("even_if_alive", ""), None, None, None], NONE, false, false),
     c(72, "Assist unit", "Creature", NONE, NONE, false, true),
@@ -431,7 +432,7 @@ pub const COMMANDS: [Command; 94] = [
     c(87, "Reset door or button", "GameObject", NONE, NONE, false, false),
     c(88, "Set command state", "Creature", [n("command_state", "CommandStates: 0 stay, 1 follow, 2 attack, 3 dismiss"), None, None, None], NONE, false, false),
     c(89, "Play custom animation", "GameObject", [n("anim_id", ""), None, None, None], NONE, false, false),
-    c(90, "Start script on group", "Unit", [p("generic_script_id", Kind::Ref(GENERIC), ""), p("generic_script_id 2", Kind::Ref(GENERIC), ""), p("generic_script_id 3", Kind::Ref(GENERIC), ""), p("generic_script_id 4", Kind::Ref(GENERIC), "")], [n("chance", "of the first, in percent"), n("chance 2", ""), n("chance 3", ""), n("chance 4", "the four together at most 100")], false, false),
+    c(90, "Start script on group", "Unit", [p("generic_script_id", Kind::Ref(GENERIC), ""), p("generic_script_id 2", Kind::Ref(GENERIC), ""), p("generic_script_id 3", Kind::Ref(GENERIC), ""), p("generic_script_id 4", Kind::Ref(GENERIC), "")], [n("chance", "chance of the first, in percent"), n("chance 2", ""), n("chance 3", ""), n("chance 4", "chance of the fourth; the four together at most 100")], false, false),
     c(91, "Load creature spawn", "Map", [n("db_guid", "creature spawn guid"), yes("with_group", ""), None, None], NONE, false, false),
     c(92, "Start script on zone", "Map", [p("generic_script_id", Kind::Ref(GENERIC), ""), p("zone_id", Kind::Ref("AreaTable"), ""), yes("with_pets", ""), None], NONE, false, false),
     c(93, "Follow escort", "Creature", [yes("do_follow", ""), None, None, None], NONE, false, true),
@@ -454,30 +455,31 @@ pub fn command(value: u32) -> Option<&'static Command> {
 }
 
 /// The twenty columns `LoadScripts` selects, plus `priority` (in its `ORDER
-/// BY`) and `comments` (never read by the server, kept for the person).
+/// BY`) and `comments` (never read by the server; a note for whoever edits
+/// the table).
 pub const COLUMNS: [Column; 22] = [
-    Column { name: "id", kind: Kind::Key, group: Group::Identity, about: "which script the row belongs to" },
+    Column { name: "id", kind: Kind::Key, group: Group::Identity, about: "the script id the row belongs to" },
     Column { name: "delay", kind: Kind::Seconds, group: Group::Identity, about: "seconds after the script starts; 0 in creature_ai_scripts" },
-    Column { name: "priority", kind: Kind::Unsigned, group: Group::Identity, about: "order among rows with one delay" },
-    Column { name: "command", kind: Kind::Choice(&COMMAND_VALUES), group: Group::Behaviour, about: "what the row does" },
-    Column { name: "datalong", kind: Kind::Unsigned, group: Group::Behaviour, about: "named by the command" },
-    Column { name: "datalong2", kind: Kind::Unsigned, group: Group::Behaviour, about: "named by the command" },
-    Column { name: "datalong3", kind: Kind::Unsigned, group: Group::Behaviour, about: "named by the command" },
-    Column { name: "datalong4", kind: Kind::Unsigned, group: Group::Behaviour, about: "named by the command" },
-    Column { name: "target_param1", kind: Kind::Unsigned, group: Group::Behaviour, about: "named by the target type" },
-    Column { name: "target_param2", kind: Kind::Unsigned, group: Group::Behaviour, about: "named by the target type" },
-    Column { name: "target_type", kind: Kind::Choice(&TARGET_VALUES), group: Group::Behaviour, about: "who the command acts on" },
+    Column { name: "priority", kind: Kind::Unsigned, group: Group::Identity, about: "order among rows with the same delay" },
+    Column { name: "command", kind: Kind::Choice(&COMMAND_VALUES), group: Group::Behaviour, about: "the command: what the row does" },
+    Column { name: "datalong", kind: Kind::Unsigned, group: Group::Behaviour, about: "its meaning depends on the command" },
+    Column { name: "datalong2", kind: Kind::Unsigned, group: Group::Behaviour, about: "its meaning depends on the command" },
+    Column { name: "datalong3", kind: Kind::Unsigned, group: Group::Behaviour, about: "its meaning depends on the command" },
+    Column { name: "datalong4", kind: Kind::Unsigned, group: Group::Behaviour, about: "its meaning depends on the command" },
+    Column { name: "target_param1", kind: Kind::Unsigned, group: Group::Behaviour, about: "its meaning depends on the target type" },
+    Column { name: "target_param2", kind: Kind::Unsigned, group: Group::Behaviour, about: "its meaning depends on the target type" },
+    Column { name: "target_type", kind: Kind::Choice(&TARGET_VALUES), group: Group::Behaviour, about: "the target type: who the command acts on" },
     Column { name: "data_flags", kind: Kind::Flags(&DATA_FLAGS), group: Group::Behaviour, about: "how source and target are swapped, and what a failure does" },
-    Column { name: "dataint", kind: Kind::Signed, group: Group::Behaviour, about: "named by the command" },
-    Column { name: "dataint2", kind: Kind::Signed, group: Group::Behaviour, about: "named by the command" },
-    Column { name: "dataint3", kind: Kind::Signed, group: Group::Behaviour, about: "named by the command" },
-    Column { name: "dataint4", kind: Kind::Signed, group: Group::Behaviour, about: "named by the command" },
-    Column { name: "x", kind: Kind::Float, group: Group::Place, about: "read by the commands that move or place" },
-    Column { name: "y", kind: Kind::Float, group: Group::Place, about: "" },
-    Column { name: "z", kind: Kind::Float, group: Group::Place, about: "" },
-    Column { name: "o", kind: Kind::Float, group: Group::Place, about: "" },
-    Column { name: "condition_id", kind: Kind::Unsigned, group: Group::Advanced, about: "a row of conditions the row is skipped without, or 0" },
-    Column { name: "comments", kind: Kind::Text, group: Group::Advanced, about: "for the person; the server never reads it" },
+    Column { name: "dataint", kind: Kind::Signed, group: Group::Behaviour, about: "its meaning depends on the command" },
+    Column { name: "dataint2", kind: Kind::Signed, group: Group::Behaviour, about: "its meaning depends on the command" },
+    Column { name: "dataint3", kind: Kind::Signed, group: Group::Behaviour, about: "its meaning depends on the command" },
+    Column { name: "dataint4", kind: Kind::Signed, group: Group::Behaviour, about: "its meaning depends on the command" },
+    Column { name: "x", kind: Kind::Float, group: Group::Place, about: "x: read by the commands that move or place" },
+    Column { name: "y", kind: Kind::Float, group: Group::Place, about: "y: read by the commands that move or place" },
+    Column { name: "z", kind: Kind::Float, group: Group::Place, about: "z: read by the commands that move or place" },
+    Column { name: "o", kind: Kind::Float, group: Group::Place, about: "orientation: read by the commands that move or place" },
+    Column { name: "condition_id", kind: Kind::Unsigned, group: Group::Advanced, about: "a conditions entry that must hold or the row is skipped, or 0" },
+    Column { name: "comments", kind: Kind::Text, group: Group::Advanced, about: "a label for editors; not read by the server" },
 ];
 
 /// One row of a script: the columns as the server reads them.
@@ -937,7 +939,7 @@ pub struct Script {
 }
 
 impl Script {
-    /// A script with no rows, which written is a script removed.
+    /// A script with no rows. Writing it removes the script.
     pub fn empty(table: &'static str, id: u32) -> Script {
         Script { table, id, rows: Vec::new() }
     }
@@ -1100,7 +1102,7 @@ fn settle(mut rows: Vec<ScriptRow>) -> Vec<ScriptRow> {
     rows
 }
 
-/// The statements a script comes to: every row under the id deleted, then
+/// The SQL statements that write a script: every row under the id deleted, then
 /// one `INSERT` per row in the server's order. A script with no rows is the
 /// `DELETE` alone.
 pub fn statements(script: &Script) -> Vec<String> {
@@ -1136,7 +1138,8 @@ pub fn rows_query(table: &str, id: u32) -> String {
     )
 }
 
-/// What puts a script back as it stood: the same `DELETE`, then the rows read.
+/// The statements that restore a script to the rows read: the same `DELETE`,
+/// then one `INSERT` per row.
 pub fn undo_from_rows(table: &str, id: u32, rows: &[Row]) -> Vec<String> {
     let mut out = vec![format!(
         "DELETE FROM {} WHERE `id` = {id};",
@@ -1179,7 +1182,7 @@ pub fn search_query(table: &str, term: &str, limit: usize) -> String {
     )
 }
 
-/// The `broadcast_text` entries a row says, when it is a Talk row. See
+/// The `broadcast_text` entries a Talk row names; empty for any other row. See
 /// [`crate::broadcast`], which reads them.
 pub fn texts_of(row: &ScriptRow) -> Vec<u32> {
     match row.command {
@@ -1195,18 +1198,18 @@ pub fn max_id_query(table: &str) -> String {
 
 /// Every script a project has edited.
 ///
-/// [`crate::path::Paths`] for scripts: keyed by table and id, so a script
-/// edited twice is one entry and the last reading wins. A script that is
-/// present with no rows is the edit that removes it; a script not present is
-/// one the project says nothing about.
+/// The script counterpart of [`crate::path::Paths`]: keyed by table and id,
+/// so a script edited twice is one entry and the last reading wins. A script
+/// that is present with no rows is the edit that removes it; a script not
+/// present is one the project says nothing about.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Scripts {
     scripts: std::collections::BTreeMap<(&'static str, u32), Vec<ScriptRow>>,
 }
 
 impl Scripts {
-    /// Set what this project says a script is, in the server's order. No
-    /// rows is a script removed.
+    /// Set what this project says a script is, in the server's order. A
+    /// script with no rows records its removal.
     pub fn set(&mut self, script: &Script) {
         self.scripts.insert((script.table, script.id), script.sorted());
     }
@@ -1277,8 +1280,8 @@ impl Scripts {
     }
 
     /// The store read from a file [`Scripts::to_text`] wrote. A damaged line
-    /// is skipped and the rest are read, on [`crate::row::Edits::from_text`]'s
-    /// rule. A `row` line for a script with no `script` line declares the
+    /// is skipped and the rest are read, as [`crate::row::Edits::from_text`]
+    /// does. A `row` line for a script with no `script` line declares the
     /// script as well.
     pub fn from_text(text: &str) -> Scripts {
         let mut out = Scripts::default();

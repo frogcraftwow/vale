@@ -112,14 +112,21 @@ pub fn draw(ui: &mut egui::Ui, subject: Subject<'_>, editing: &mut Editing<'_>) 
             theme::heading(ui, "Pointer");
             theme::note(
                 ui,
-                "The pointer reports where it is and changes nothing. Pick a \
-                 subject on the left to start editing, or Measure for what is at \
-                 a point and the distance between two.",
+                "Select reports the position under the pointer and changes \
+                 nothing. Choose a tool on the rail to edit, or Measure to inspect \
+                 a point and the distance between two points.",
             );
         }
         Tool::Measure => measure(ui, &mut editing.measuring, session, cursor, tables),
         Tool::Terrain => brush(ui, &mut editing.terrain),
         Tool::Grade => grading(ui, &mut editing.grading, session),
+        Tool::Road => road(
+            ui,
+            &mut editing.road,
+            &mut editing.textures,
+            &mut editing.thumbnails,
+            session,
+        ),
         Tool::Shading => shading(ui, &mut editing.shading),
         Tool::Holes => holes(ui, &editing.holes, session),
         Tool::Areas => zones(ui, &mut editing.areas, session, tables, cursor),
@@ -200,6 +207,30 @@ pub fn draw(ui: &mut egui::Ui, subject: Subject<'_>, editing: &mut Editing<'_>) 
                 server_panel,
             },
         ),
+        // Area triggers and safe places are client tables whose rows are
+        // places, picked in the viewport like a flight node, with server rows
+        // beside them.
+        Tool::Triggers => super::triggers::draw(
+            ui,
+            super::triggers::Subject {
+                session,
+                triggers: &mut editing.triggers,
+                assets,
+                now,
+                server_panel,
+                behaviour: &mut editing.behaviour,
+            },
+        ),
+        Tool::Graveyards => super::graveyards::draw(
+            ui,
+            super::graveyards::Subject {
+                session,
+                graveyards: &mut editing.graveyards,
+                assets,
+                now,
+                server_panel,
+            },
+        ),
         // The server's creatures are picked in the viewport like a light, so
         // their form is drawn here for the same reason. It shows two rows: the
         // spawn that was clicked and the template behind it. See
@@ -214,6 +245,7 @@ pub fn draw(ui: &mut egui::Ui, subject: Subject<'_>, editing: &mut Editing<'_>) 
                 loot: &mut editing.loot,
                 behaviour: &mut editing.behaviour,
                 services: &mut editing.services,
+                gossip: &mut editing.gossip,
                 server,
                 server_panel,
                 assets,
@@ -322,10 +354,10 @@ fn water(ui: &mut egui::Ui, water: &mut crate::tools::water::Water) {
                         theme::note(ui, water::flag_words(flags));
                     }
                 }
-                None => theme::note(ui, "dry"),
+                None => theme::note(ui, "no water"),
             }
         }
-        None => theme::note(ui, "the pointer is over no open tile"),
+        None => theme::note(ui, "pointer is not over an open tile"),
     }
 
     ui.add_space(4.0);
@@ -355,8 +387,8 @@ fn water(ui: &mut egui::Ui, water: &mut crate::tools::water::Water) {
         let over = here - ground;
         ui.label(
             egui::RichText::new(match over >= 0.0 {
-                true => format!("{over:.2} yd over the ground here"),
-                false => format!("{:.2} yd UNDER the ground here", -over),
+                true => format!("{over:.2} yd above the ground at the pointer"),
+                false => format!("{:.2} yd below the ground at the pointer", -over),
             })
             .size(theme::SMALL)
             .color(match over >= 0.0 {
@@ -372,8 +404,8 @@ fn water(ui: &mut egui::Ui, water: &mut crate::tools::water::Water) {
         }
         true => {
             theme::note(ui, "space sets the start, shift + space the end");
-            theme::note(ui, "height from the water there, or with ctrl the ground");
-            theme::note(ui, "level past either end");
+            theme::note(ui, "height from the water at the pointer, or with ctrl the ground");
+            theme::note(ui, "flat beyond either end");
         }
     }
 
@@ -388,13 +420,14 @@ fn water(ui: &mut egui::Ui, water: &mut crate::tools::water::Water) {
         (
             vale_edit::adt::liquid::FISHABLE,
             "fishable",
-            "Set on nearly every sea and lake cell the game shipped.",
+            "Set on nearly every sea and lake cell in the shipped maps.",
         ),
         (
             vale_edit::adt::liquid::FATIGUE,
             "deep water",
-            "Fatigue: where a swimmer drowns. The open sea and nothing else. \
-             The one bit vmangos reads.",
+            "Fatigue flag: a swimmer in these cells takes fatigue damage. The \
+             shipped maps set it on open sea only. vmangos reads this bit and \
+             no other.",
         ),
     ] {
         let mut on = water.brush.cell_flags & bit != 0;
@@ -432,11 +465,11 @@ fn water(ui: &mut egui::Ui, water: &mut crate::tools::water::Water) {
     theme::note(ui, "left button floods · shift + left drains");
     theme::note(
         ui,
-        "alt + left marks the wet cells with the two flags, moving nothing",
+        "alt + left writes the two flags to wet cells, level unchanged",
     );
     theme::note(ui, "ctrl + left updates depth from the ground below");
     theme::note(ui, "ctrl + wheel resizes");
-    theme::note(ui, "the character mover reads the same file");
+    theme::note(ui, "playtest movement reads the same MCLQ data");
 }
 
 /// The two ends of a sloped surface: each one's height, or that it is not
@@ -483,7 +516,7 @@ fn slope_rows(ui: &mut egui::Ui, water: &mut crate::tools::water::Water) {
 /// not the file's.
 fn crawls((turn, rate, on): (u32, u32, bool)) -> String {
     if !on {
-        return "still".to_string();
+        return "not animated".to_string();
     }
     const COMPASS: [&str; 8] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
     let speed =
@@ -499,11 +532,11 @@ fn crawls((turn, rate, on): (u32, u32, bool)) -> String {
 /// names and how many a cell gets, or that it plants nothing.
 fn grows(assets: &vale_client::assets::GameAssets, effect_id: u32) -> String {
     if effect_id == 0 {
-        return "grows nothing".to_string();
+        return "no ground effect".to_string();
     }
     let effects = assets.ground_effects();
     let Some(effect) = effects.effect(effect_id) else {
-        return format!("effect {effect_id} plants nothing");
+        return format!("GroundEffectTexture {effect_id} not found");
     };
     let mut names: Vec<String> = effect.models
         [..usize::from(effect.choices).min(effect.models.len())]
@@ -519,7 +552,7 @@ fn grows(assets: &vale_client::assets::GameAssets, effect_id: u32) -> String {
         })
         .collect();
     names.dedup();
-    format!("grows {} · {} a cell", names.join(", "), effect.density)
+    format!("{} · {} per cell", names.join(", "), effect.density)
 }
 
 /// Whether the server lets a character walk on the chunk under the pointer.
@@ -539,7 +572,7 @@ fn impassability(ui: &mut egui::Ui, session: &mut EditSession, cursor: &Cursor) 
 
     theme::heading(ui, "Walkable");
     let Some((coord, chunk)) = cursor.tile.zip(cursor.chunk) else {
-        theme::note(ui, "the pointer is over no chunk");
+        theme::note(ui, "pointer is not over a chunk");
         ui.add_space(6.0);
         return;
     };
@@ -631,11 +664,11 @@ fn zones(
                 }
             }
         }
-        None => theme::note(ui, "the pointer is over no open tile"),
+        None => theme::note(ui, "pointer is not over an open tile"),
     }
 
     ui.add_space(4.0);
-    theme::heading(ui, "Painting");
+    theme::heading(ui, "Brush area");
     ui.label(egui::RichText::new(name_of(areas.brush.area)).color(theme::INK));
     theme::note(ui, "space takes the area under the pointer");
     // What the area on the brush is, and the two ways to make one. The rows
@@ -651,8 +684,8 @@ fn zones(
             if ui
                 .add_enabled(on_brush.is_some(), egui::Button::new("Edit\u{2026}").small())
                 .on_hover_text(
-                    "Open this area in the Zones workspace: its name, its zone, its music \
-                     and ambience, its flags and how it is explored.",
+                    "Open the brush's area in the Zones workspace to edit its name, parent \
+                     zone, music, ambience, flags and exploration.",
                 )
                 .on_disabled_hover_text("AreaTable has no row for the area on the brush.")
                 .clicked()
@@ -663,10 +696,10 @@ fn zones(
                 .add_enabled(on_brush.is_some(), egui::Button::new("+ Sub-area").small())
                 .on_hover_text(match &zone {
                     Some(zone) => format!(
-                        "A new area inside {zone}, with that zone's flags, ambience and \
-                         music, put on the brush. Name it with Edit\u{2026}."
+                        "Create a sub-area of {zone} with that zone's flags, ambience and \
+                         music, and put it on the brush. Name it with Edit\u{2026}."
                     ),
-                    None => "A new area inside the zone on the brush.".to_string(),
+                    None => "Create a sub-area of the zone on the brush.".to_string(),
                 })
                 .on_disabled_hover_text("Put a zone or one of its areas on the brush first.")
                 .clicked()
@@ -676,7 +709,7 @@ fn zones(
             if ui
                 .small_button("+ Zone")
                 .on_hover_text(
-                    "A new zone on this map, put on the brush. Name it with Edit\u{2026}.",
+                    "Create a zone on this map and put it on the brush. Name it with Edit\u{2026}.",
                 )
                 .clicked()
             {
@@ -744,9 +777,9 @@ fn zones(
     theme::note(ui, "space takes the area under the pointer");
     theme::note(
         ui,
-        "a chunk is the unit: 33 yards, and the file has nothing finer",
+        "area ids are per chunk (33 yd); the file has no finer unit",
     );
-    theme::note(ui, "a playtest reads this value for its zone text");
+    theme::note(ui, "a playtest shows this area as the zone text");
 }
 
 /// `AreaTable`'s own hierarchy as a tree. Returns the row a click chose.
@@ -876,7 +909,7 @@ fn holes(ui: &mut egui::Ui, holes: &crate::tools::holes::Holes, session: &EditSe
             });
             ui.label(
                 egui::RichText::new(match holes.already {
-                    true => "already cut — shift-click puts it back",
+                    true => "already cut — shift-click fills it",
                     false => "solid — click cuts it",
                 })
                 .size(theme::SMALL)
@@ -886,7 +919,7 @@ fn holes(ui: &mut egui::Ui, holes: &crate::tools::holes::Holes, session: &EditSe
                 }),
             );
         }
-        None => theme::note(ui, "the pointer is over no open tile"),
+        None => theme::note(ui, "pointer is not over an open tile"),
     }
 
     ui.add_space(4.0);
@@ -909,18 +942,18 @@ fn holes(ui: &mut egui::Ui, holes: &crate::tools::holes::Holes, session: &EditSe
             ui,
             match holes.cut > 0 {
                 true => format!("{} cut this session", holes.cut),
-                false => format!("{} patched this session", -holes.cut),
+                false => format!("{} filled this session", -holes.cut),
             },
         );
     }
 
     ui.add_space(6.0);
     theme::heading(ui, "Keys");
-    theme::note(ui, "left button cuts · drag cuts a run of them");
-    theme::note(ui, "shift + left button puts the ground back");
+    theme::note(ui, "left button cuts · drag cuts every square it crosses");
+    theme::note(ui, "shift + left button fills");
     theme::note(
         ui,
-        "sixteen squares per chunk, and the file has nothing smaller",
+        "16 squares per chunk; the file has no finer unit",
     );
 }
 
@@ -929,7 +962,7 @@ fn holes(ui: &mut egui::Ui, holes: &crate::tools::holes::Holes, session: &EditSe
 /// for is shown as the number.
 fn area_name(table: Option<&vale_assets::tables::area::Areas>, id: u32) -> String {
     match (id, table.and_then(|table| table.get(id))) {
-        (0, _) => "nowhere".to_string(),
+        (0, _) => "no area (0)".to_string(),
         (id, Some(area)) => format!("{} ({id})", area.name),
         (id, None) => format!("area {id}"),
     }
@@ -1010,7 +1043,7 @@ fn chunks(
                 theme::note(
                     ui,
                     format!(
-                        "{} more in tiles that are not open; no operation reaches them",
+                        "{} more in tiles that are not open; operations skip them",
                         census.closed
                     ),
                 );
@@ -1040,7 +1073,7 @@ fn chunks(
         }
         if ui
             .add_enabled(census.open + census.closed > 0, egui::Button::new("Deselect"))
-            .on_hover_text("Escape. Select nothing.")
+            .on_hover_text("Escape. Clear the selection.")
             .clicked()
         {
             chunks.clear();
@@ -1067,8 +1100,8 @@ fn chunks(
     .id_salt("chunks-keys")
     .show(ui, |ui| {
         theme::note(ui, "click selects a chunk · drag selects a block");
-        theme::note(ui, "shift adds · shift + click on a selected chunk takes it out");
-        theme::note(ui, "ctrl + a the tile under the pointer · escape deselects");
+        theme::note(ui, "shift adds · shift + click on a selected chunk removes it");
+        theme::note(ui, "ctrl + a selects the tile under the pointer · escape deselects");
         theme::note(ui, "ctrl + c copies · ctrl + v pastes at the pointer");
     });
     ui.add_space(2.0);
@@ -1085,7 +1118,7 @@ fn chunks(
                     tile.0, tile.1, within.0, within.1
                 )
             }
-            None => "the pointer is over no open tile".to_string(),
+            None => "pointer is not over an open tile".to_string(),
         },
     );
 }
@@ -1135,8 +1168,8 @@ fn chunks_paste(
                 "Turn 90\u{b0}",
                 tool::Turn::Clockwise,
                 "Turn the copied block a quarter turn clockwise, seen from above: heights, \
-                 blends, shading, holes and water together. Four presses are the block as \
-                 it was copied.",
+                 blends, shading, holes and water together. Four presses restore the \
+                 original orientation.",
             ),
             (
                 "Mirror",
@@ -1147,7 +1180,7 @@ fn chunks_paste(
             if ui
                 .add_enabled(held, egui::Button::new(label).small())
                 .on_hover_text(about)
-                .on_disabled_hover_text("Copy some chunks first.")
+                .on_disabled_hover_text("Copy chunks first.")
                 .clicked()
             {
                 chunks.clip = chunks.clip.turned(how);
@@ -1160,11 +1193,11 @@ fn chunks_paste(
     });
     theme::note(
         ui,
-        "ctrl + v pastes, centred on the chunk under the pointer. Hold ctrl to see where.",
+        "ctrl + v pastes centred on the chunk under the pointer · hold ctrl to preview",
     );
 
     ui.add_space(6.0);
-    theme::heading(ui, "What a paste writes");
+    theme::heading(ui, "Paste includes");
     // A part switched off is left as the ground under the paste has it.
     ui.horizontal_wrapped(|ui| {
         let parts = &mut chunks.parts;
@@ -1221,8 +1254,8 @@ fn chunks_stitch(
     theme::note(
         ui,
         "Joins the selection's border to the ground around it. Every vertex on the \
-         border is moved to one height, and the ground within reach of the border \
-         follows it, on the side that moves.",
+         border is moved to one height, and the ground within the reach distance \
+         blends toward it on the side that moves.",
     );
     ui.add_space(4.0);
     theme::row(ui, "border", |ui| {
@@ -1294,7 +1327,7 @@ fn chunks_stitch(
     }
     theme::note(
         ui,
-        "One undo entry. Nothing standing on the moved ground moves with it.",
+        "One undo entry. Doodads, WMOs and spawns on the moved ground are not moved.",
     );
 }
 
@@ -1342,7 +1375,7 @@ fn chunks_area(
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add_enabled(*id != areas.brush.area, egui::Button::new("use").small())
-                    .on_hover_text("Take this as the area to write.")
+                    .on_hover_text("Put this area on the brush, as the area Set writes.")
                     .clicked()
                 {
                     areas.brush.area = *id;
@@ -1401,7 +1434,7 @@ fn chunks_area(
                 .clicked()
             {
                 let changed = tool::set_impassable(session, &chunks.selected, on);
-                session.status = format!("{} on {changed} chunk(s)", label.to_lowercase());
+                session.status = format!("marked {} on {changed} chunk(s)", label.to_lowercase());
             }
         }
         theme::note(
@@ -1423,19 +1456,19 @@ fn chunks_holes(
 
     let any = census.open > 0;
     ui.horizontal(|ui| {
-        for (label, cut) in [("Cut", true), ("Patch", false)] {
+        for (label, cut) in [("Cut", true), ("Fill", false)] {
             if ui
                 .add_enabled(any, egui::Button::new(label))
                 .on_hover_text(match cut {
                     true => "Cut all sixteen squares of every selected chunk.",
-                    false => "Put back all sixteen squares of every selected chunk.",
+                    false => "Fill all sixteen squares of every selected chunk.",
                 })
                 .clicked()
             {
                 let changed = tool::set_holes(session, &chunks.selected, cut);
                 session.status = match cut {
-                    true => format!("cut {changed} chunk(s)"),
-                    false => format!("patched {changed} chunk(s)"),
+                    true => format!("cut holes in {changed} chunk(s)"),
+                    false => format!("filled holes in {changed} chunk(s)"),
                 };
             }
         }
@@ -1446,7 +1479,7 @@ fn chunks_holes(
     });
     theme::note(
         ui,
-        "One square at a time is the Holes tool, under the pointer.",
+        "To cut or fill one square at a time, use the Holes tool.",
     );
 }
 
@@ -1493,12 +1526,12 @@ fn chunks_textures(
             if let Some(path) = &chosen {
                 let changed = tool::set_base(session, &chunks.selected, path);
                 session.status =
-                    format!("{changed} chunk(s) re-based on {}", textures::leaf(path));
+                    format!("base texture of {changed} chunk(s) set to {}", textures::leaf(path));
             }
         }
         if ui
             .add_enabled(any, egui::Button::new("Clear to base"))
-            .on_hover_text("Take every layer but the base off every selected chunk.")
+            .on_hover_text("Remove every layer except the base from every selected chunk.")
             .clicked()
         {
             let changed = tool::clear_paint(session, &chunks.selected);
@@ -1507,7 +1540,7 @@ fn chunks_textures(
     });
 
     ui.add_space(6.0);
-    theme::heading(ui, "On the selection");
+    theme::heading(ui, "Selection textures");
     // The textures the selection carries. `swap` and `×` act on every chunk
     // that carries the row's texture, which is the chunk list's two buttons
     // over a selection.
@@ -1529,8 +1562,8 @@ fn chunks_textures(
                 theme::note(
                     ui,
                     match based {
-                        0 => format!("on {carried}"),
-                        _ => format!("on {carried}, the base of {based}"),
+                        0 => format!("in {carried} chunk(s)"),
+                        _ => format!("in {carried} chunk(s), the base in {based}"),
                     },
                 );
             });
@@ -1538,11 +1571,11 @@ fn chunks_textures(
                 if ui
                     .add_enabled(carried > based, egui::Button::new("×").small())
                     .on_hover_text(
-                        "Take this texture's layer off every selected chunk that \
-                         carries it above its base.",
+                        "Remove this texture's layer from every selected chunk \
+                         where it is not the base.",
                     )
                     .on_disabled_hover_text(
-                        "It is only a base here. A base is replaced, not removed.",
+                        "This texture is only a base here. A base can be replaced with Base, not removed.",
                     )
                     .clicked()
                 {
@@ -1554,8 +1587,8 @@ fn chunks_textures(
                 if ui
                     .add_enabled(differs, egui::Button::new("swap").small())
                     .on_hover_text(
-                        "Make this texture's layer draw the chosen texture instead, on \
-                         every selected chunk that carries it, keeping each blend map.",
+                        "Replace this texture with the chosen texture on every \
+                         selected chunk that carries it. Blend maps are kept.",
                     )
                     .on_disabled_hover_text("Choose another texture below.")
                     .clicked()
@@ -1575,7 +1608,7 @@ fn chunks_textures(
         theme::note(
             ui,
             format!(
-                "{} carry four textures, the most a chunk may.",
+                "{} chunk(s) carry four textures, the maximum per chunk.",
                 census.full
             ),
         );
@@ -1583,7 +1616,7 @@ fn chunks_textures(
     if let (Some(from), Some(to)) = (&swap, &chosen) {
         let changed = tool::swap_texture(session, &chunks.selected, from, to);
         session.status = format!(
-            "{} now draws {} on {changed} chunk(s)",
+            "replaced {} with {} on {changed} chunk(s)",
             textures::leaf(from),
             textures::leaf(to)
         );
@@ -1640,7 +1673,7 @@ fn placing(
             let folder = Placing::folder_of(&path);
             if placing.folder(kind) != folder
                 && ui
-                    .small_button(egui::RichText::new("show its folder").color(theme::INK_DIM))
+                    .small_button(egui::RichText::new("show folder").color(theme::INK_DIM))
                     .clicked()
             {
                 placing.open_folder(kind, &folder);
@@ -1654,7 +1687,7 @@ fn placing(
     // necessary.
     if let Some(bad) = placing.trouble.clone() {
         ui.label(
-            egui::RichText::new(format!("{} does not open", place::leaf(&bad)))
+            egui::RichText::new(format!("{} failed to load", place::leaf(&bad)))
                 .color(theme::BAD)
                 .size(theme::SMALL),
         )
@@ -1700,7 +1733,7 @@ fn placing(
         );
     });
     if kind == Kind::Doodad {
-        theme::row(ui, "size", |ui| {
+        theme::row(ui, "scale", |ui| {
             ui.add(
                 egui::DragValue::new(&mut placing.scale)
                     .speed(0.01)
@@ -1716,11 +1749,11 @@ fn placing(
     if kind == Kind::Doodad {
         ui.add_space(4.0);
         theme::heading(ui, "Ground");
-        ui.checkbox(&mut placing.align, "lean each drop onto the slope under it")
+        ui.checkbox(&mut placing.align, "align each placement to the slope")
             .on_hover_text(
-                "The two leans are taken from the ground's normal under the \
-                 cursor, at the current turn, instead of from the roll. The \
-                 ghost shows it before the click.",
+                "Tilts each placed model to the ground normal under the \
+                 cursor, keeping the current turn, instead of using the \
+                 scatter tilt. The preview shows the result before the click.",
             );
     }
 
@@ -1728,18 +1761,18 @@ fn placing(
     // these bounds. See `crate::tools::place`'s module comment.
     ui.add_space(4.0);
     theme::heading(ui, "Scatter");
-    ui.checkbox(&mut placing.scatter.on, "roll the next one after each drop")
+    ui.checkbox(&mut placing.scatter.on, "randomise after each placement")
         .on_hover_text(
-            "With this on, every placement draws a fresh turn, size and lean \
-             for the next one, so a copse does not look stamped. The ghost \
-             shows what the next click writes.",
+            "After each placement, picks a random turn, scale and tilt for \
+             the next one within the ranges below. The preview shows what \
+             the next click writes.",
         );
     if placing.scatter.on {
         theme::row(ui, "turn", |ui| {
-            ui.checkbox(&mut placing.scatter.turn, "anywhere in the circle");
+            ui.checkbox(&mut placing.scatter.turn, "any angle");
         });
         if kind == Kind::Doodad {
-            theme::row(ui, "size", |ui| {
+            theme::row(ui, "scale", |ui| {
                 ui.add(
                     egui::DragValue::new(&mut placing.scatter.size.0)
                         .speed(0.01)
@@ -1756,7 +1789,7 @@ fn placing(
                         .suffix("x"),
                 );
             });
-            theme::row(ui, "lean", |ui| {
+            theme::row(ui, "tilt", |ui| {
                 ui.add(
                     egui::DragValue::new(&mut placing.scatter.tilt_max)
                         .speed(0.5)
@@ -1765,13 +1798,13 @@ fn placing(
                         .suffix("°"),
                 )
                 .on_hover_text(
-                    "The most a drop leans off the vertical, in any direction. Zero is upright.",
+                    "Maximum tilt from vertical, in any direction. Zero keeps the model upright.",
                 );
             });
         }
         if ui
-            .small_button("Roll now")
-            .on_hover_text("Draw the next one again without placing anything.")
+            .small_button("Randomise now")
+            .on_hover_text("Pick new random values for the next placement without placing anything.")
             .clicked()
         {
             placing.roll();
@@ -1780,13 +1813,13 @@ fn placing(
 
     ui.add_space(6.0);
     theme::heading(ui, "Keys");
-    theme::note(ui, "left button places · it stays armed for the next one");
-    theme::note(ui, ", and . turn · shift is three times");
+    theme::note(ui, "left button places · the model stays on the cursor");
+    theme::note(ui, ", and . turn · shift turns three times as far");
     if kind == Kind::Doodad {
         theme::note(ui, "ctrl + wheel scales");
     }
-    theme::note(ui, "escape disarms it");
-    theme::note(ui, "alt + mouse turns it · ctrl snaps to 15°");
+    theme::note(ui, "escape clears the model from the cursor");
+    theme::note(ui, "alt + mouse turns the model · ctrl snaps to 15°");
     theme::note(ui, "tab, or 1 and 2, switch select and place");
     true
 }
@@ -1923,7 +1956,7 @@ pub(super) fn preview_pane_at(
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .small_button("reset")
-                    .on_hover_text("Back to the view the rows are drawn from.")
+                    .on_hover_text("Reset the preview to the camera angle the list rows use.")
                     .clicked()
                 {
                     portraits.reset_large_turn();
@@ -2244,9 +2277,12 @@ fn wmo(
 
     ui.add_space(4.0);
     theme::heading(ui, "Selection");
-    let chosen: Vec<&str> = selection.members().map(|at| at.path.as_str()).collect();
+    let chosen: Vec<(u32, &str)> =
+        selection.members().map(|at| (at.unique_id, at.path.as_str())).collect();
     match group(ui, &chosen, "WMOs") {
         Group::Nothing => {}
+        Group::Primary(id) => selection.promote(id),
+        Group::Drop(id) => selection.also.retain(|at| at.unique_id != id),
         Group::Only => {
             let primary = selection.at.take();
             selection.only(primary);
@@ -2262,13 +2298,20 @@ fn wmo(
                 session.status = format!("{} selected", selection.count());
             }
         }
+        Group::Lock => {
+            let ids: Vec<u32> = selection.members().map(|at| at.unique_id).collect();
+            let n = session.set_placements_locked(Kind::Wmo, ids, true);
+            selection.only(None);
+            session.status = format!("locked {n} WMOs");
+        }
     }
+    locked_placements(ui, session, Kind::Wmo);
     let grouped = selection.count() > 1;
     let Some(at) = selection.at.as_mut() else {
         theme::note(
             ui,
             "Click a building in the world to select it, or drag a rectangle on \
-             empty ground. Only a placement that is drawn can be picked.",
+             empty ground. Only visible placements can be selected.",
         );
         return;
     };
@@ -2332,7 +2375,7 @@ fn wmo(
     theme::row(ui, "name set", |ui| {
         ui.add(egui::DragValue::new(&mut at.record.name_set).speed(0.1));
     });
-    theme::note(ui, "which dressing of the model, and which name set");
+    theme::note(ui, "indices into the WMO's doodad sets and name sets");
 
     ui.add_space(4.0);
     theme::heading(ui, "Bounds");
@@ -2358,8 +2401,8 @@ fn wmo(
     ui.add_space(6.0);
     theme::heading(ui, "Keys");
     theme::note(ui, "drag to move · ctrl-drag drops it onto the ground");
-    theme::note(ui, "arrows nudge 5 yd · shift is ten times");
-    theme::note(ui, ", and . turn about z · alt + mouse sweeps it");
+    theme::note(ui, "arrows nudge 5 yd · shift nudges ten times as far");
+    theme::note(ui, ", and . turn about z · alt + mouse turns it");
     theme::note(ui, "delete removes it · ctrl+d duplicates");
     theme::note(ui, "shift + click adds or removes one");
     theme::note(ui, "drag on empty ground selects a rectangle");
@@ -2423,7 +2466,7 @@ fn table(ui: &mut egui::Ui, mut work: super::data::Workspace<'_>) {
     // The Tables workspace on its list of tables: nothing is selected.
     if name.is_empty() {
         theme::heading(ui, "Table");
-        theme::note(ui, "Choose a table to see its file and what a row points at.");
+        theme::note(ui, "Choose a table to see its file and the open row's references.");
         return;
     }
     let session = &mut *work.session;
@@ -2439,7 +2482,7 @@ fn table(ui: &mut egui::Ui, mut work: super::data::Workspace<'_>) {
         });
     }
     let unsaved = session.unsaved_tables.contains(&name);
-    theme::row(ui, "written", |ui| match unsaved {
+    theme::row(ui, "status", |ui| match unsaved {
         true => {
             ui.label(egui::RichText::new("unsaved").color(theme::WARN));
         }
@@ -2496,8 +2539,8 @@ fn history(
     theme::note(
         ui,
         match (&undo, depth) {
-            (Some(label), 1) => format!("{label} — 1 step on the stack"),
-            (Some(label), n) => format!("{label} — {n} steps on the stack"),
+            (Some(label), 1) => format!("{label} — 1 step to undo"),
+            (Some(label), n) => format!("{label} — {n} steps to undo"),
             (None, _) => "nothing to undo".to_string(),
         },
     );
@@ -2520,18 +2563,18 @@ fn measure(
 
     theme::note(
         ui,
-        "Click a point to keep it, then a second to measure between them. A \
-         third click starts again; Escape clears. Nothing is changed.",
+        "Click a first point, then a second to measure between them. A third \
+         click starts over; Escape clears. Changes nothing.",
     );
 
     ui.add_space(4.0);
-    theme::heading(ui, "Between");
+    theme::heading(ui, "Between points");
     match measuring.span() {
         Some(span) => {
             theme::row(ui, "distance", |ui| {
                 ui.label(theme::number(format!("{:.2} yd", span.distance)));
             });
-            theme::row(ui, "across", |ui| {
+            theme::row(ui, "horizontal", |ui| {
                 ui.label(theme::number(format!("{:.2} yd", span.horizontal)))
                     .on_hover_text("The distance in the x-y plane, ignoring height.");
             });
@@ -2567,7 +2610,7 @@ fn measure(
     }
     if measuring.first.is_some() {
         ui.add_space(2.0);
-        if ui.button("Clear the points").clicked() {
+        if ui.button("Clear points").clicked() {
             measuring.clear();
         }
     }
@@ -2594,7 +2637,7 @@ fn measure(
             let probe = measure::probe(session, at, cursor.ground);
             probe_rows(ui, &probe, session, tables, false, None);
         }
-        None => theme::note(ui, "the pointer is over nothing on an open tile"),
+        None => theme::note(ui, "pointer is not over an open tile"),
     }
 }
 
@@ -2646,11 +2689,11 @@ fn probe_rows(
             }
         });
     }
-    theme::row(ui, "on", |ui| {
+    theme::row(ui, "surface", |ui| {
         let text = match (probe.on, probe.ground) {
-            (On::Ground, _) => "the ground".to_string(),
-            (On::Model, Some(ground)) => format!("a model, {:.2} yd above the ground", at.z - ground),
-            (On::Model, None) => "a model, with no ground under it".to_string(),
+            (On::Ground, _) => "ground".to_string(),
+            (On::Model, Some(ground)) => format!("model, {:.2} yd above the ground", at.z - ground),
+            (On::Model, None) => "model, no ground below".to_string(),
         };
         ui.label(egui::RichText::new(text).color(theme::INK));
     });
@@ -2734,8 +2777,8 @@ fn grading(
     theme::heading(ui, "Grade");
     theme::note(
         ui,
-        "Click a start, then an end; a third click starts again. Each end takes \
-         the ground's height at the click, and either height can be typed over.",
+        "Click a start, then an end; a third click starts over. Each end takes \
+         the ground height at the click, and either height can be edited.",
     );
 
     ui.add_space(4.0);
@@ -2753,7 +2796,7 @@ fn grading(
                 )
                 .on_hover_text(
                     "The height of this end of the ramp, taken from the ground at the \
-                     click. Type over it to grade to a height that has no ground at it, \
+                     click. Edit it to grade to a height that has no ground at it, \
                      such as a terrace or a bridge deck.",
                 );
                 ui.label(theme::number(format!(
@@ -2828,7 +2871,7 @@ fn grading(
 
     ui.add_space(6.0);
     let ready = grading.grade().and_then(|g| g.slope()).is_some();
-    if theme::primary(ui, "Apply the grade").clicked() && ready {
+    if theme::primary(ui, "Apply grade").clicked() && ready {
         let moved = grade::apply(session, grading);
         grading.said = match moved {
             0 => "nothing moved: the ground already has that shape".to_string(),
@@ -2837,16 +2880,303 @@ fn grading(
         session.status = grading.said.clone();
     }
     if !ready {
-        theme::note(ui, "both ends have to be picked, and not in the same place");
+        theme::note(ui, "pick two ends at different points");
     }
     ui.add_space(2.0);
-    if ui.button("Clear the ends").clicked() {
+    if ui.button("Clear ends").clicked() {
         grading.clear();
     }
     if !grading.said.is_empty() {
         ui.add_space(4.0);
         theme::note(ui, grading.said.clone());
     }
+}
+
+/// The road tool: the points, the shape the road gives the ground, the two
+/// textures it paints, and the tileset list that chooses them.
+fn road(
+    ui: &mut egui::Ui,
+    road: &mut crate::tools::road::RoadTool,
+    textures: &mut Textures,
+    thumbnails: &mut Thumbnails,
+    session: &mut EditSession,
+) {
+    use crate::tools::road::{self, Slot};
+
+    theme::heading(ui, "Road");
+    theme::note(
+        ui,
+        "Click the ground to add a point at the end of the road. Drag a point to \
+         move it; Shift+click a point to remove it. Backspace removes the last \
+         point and Enter applies. To change a road, undo it, adjust it and apply \
+         again.",
+    );
+
+    // The line: its length, its ends and its steepest part.
+    ui.add_space(4.0);
+    let path = road::path(session, road);
+    theme::row(ui, "points", |ui| {
+        ui.label(theme::number(road.points.len().to_string()));
+    });
+    match &path {
+        Some(path) => {
+            theme::row(ui, "length", |ui| {
+                ui.label(theme::number(format!("{:.1} y", path.length())));
+            });
+            if let Some((first, last)) = path.ends() {
+                theme::row(ui, "ends", |ui| {
+                    ui.label(theme::number(format!("{first:.1} z to {last:.1} z")));
+                });
+            }
+            theme::row(ui, "steepest", |ui| {
+                let degrees = path.steepest(8.0).atan().to_degrees();
+                // As on the Grade panel: above about 50 degrees a character
+                // slides rather than climbs.
+                let colour = match degrees {
+                    d if d > 50.0 => theme::BAD,
+                    d if d > 35.0 => theme::WARN,
+                    _ => theme::INK,
+                };
+                ui.label(theme::number(format!("{degrees:.0}°")).color(colour))
+                    .on_hover_text("The steepest slope along the centre line, measured over runs of 8 yards.");
+            });
+        }
+        None => theme::note(ui, "place at least two points"),
+    }
+
+    ui.add_space(6.0);
+    theme::heading(ui, "Line");
+    ui.checkbox(&mut road.curved, "Curve through the points")
+        .on_hover_text("Off: straight segments between the points.");
+    theme::segmented(
+        ui,
+        &mut road.follow_ground,
+        &[("Height from ground", true), ("Height from points", false)],
+        |a, b| a == b,
+    );
+    match road.follow_ground {
+        true => {
+            theme::row(ui, "smoothing", |ui| {
+                ui.add(
+                    egui::Slider::new(&mut road.smoothing, 0.0..=200.0)
+                        .fixed_decimals(0)
+                        .suffix(" y"),
+                )
+                .on_hover_text(
+                    "The road follows the ground under its centre line, averaged over \
+                     this many yards. Zero follows every bump.",
+                );
+            });
+        }
+        false => {
+            theme::note(ui, "each point's height, joined along the line");
+            let mut remove = None;
+            egui::ScrollArea::vertical()
+                .id_salt("road-points")
+                .max_height(140.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (i, point) in road.points.iter_mut().enumerate() {
+                        theme::row(ui, &format!("point {}", i + 1), |ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut point.height)
+                                    .speed(0.25)
+                                    .suffix(" z")
+                                    .fixed_decimals(1),
+                            );
+                            if ui.small_button("Remove").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    }
+                });
+            if let Some(i) = remove {
+                road.remove(i);
+            }
+        }
+    }
+
+    ui.add_space(6.0);
+    theme::heading(ui, "Ground");
+    ui.checkbox(&mut road.shape_ground, "Shape the ground")
+        .on_hover_text("Off: the apply paints the textures and leaves the heights unchanged.");
+    if road.shape_ground {
+        theme::row(ui, "width", |ui| {
+            ui.add(egui::Slider::new(&mut road.width, 0.5..=60.0).fixed_decimals(1).suffix(" y"))
+                .on_hover_text("From the centre line to the edge of the part moved fully to the road's height.");
+        });
+        theme::row(ui, "shoulder", |ui| {
+            ui.add(egui::Slider::new(&mut road.shoulder, 0.0..=100.0).fixed_decimals(1).suffix(" y"))
+                .on_hover_text(
+                    "How far past the width the road blends back into the ground. Zero \
+                     leaves a vertical face along both sides.",
+                );
+        });
+        theme::row(ui, "strength", |ui| {
+            ui.add(egui::Slider::new(&mut road.strength, 0.05..=1.0).fixed_decimals(2))
+                .on_hover_text("How far toward the road's height the ground moves.");
+        });
+        theme::row(ui, "crown", |ui| {
+            ui.add(egui::Slider::new(&mut road.crown, -2.0..=2.0).fixed_decimals(2).suffix(" y"))
+                .on_hover_text(
+                    "How far the centre stands above the edges. Negative makes a dished \
+                     road.",
+                );
+        });
+        theme::row(ui, "offset", |ui| {
+            ui.add(egui::Slider::new(&mut road.offset, -10.0..=10.0).fixed_decimals(2).suffix(" y"))
+                .on_hover_text(
+                    "Added to the road's height everywhere. Negative sinks the road into \
+                     the ground; positive raises it as a causeway.",
+                );
+        });
+        ui.label(egui::RichText::new("shoulder falloff").size(theme::SMALL).color(theme::INK_DIM));
+        theme::segmented(ui, &mut road.falloff, &FALLOFFS, |a, b| a == b);
+        objects_follow(ui, &mut road.objects_follow);
+    }
+
+    ui.add_space(6.0);
+    theme::heading(ui, "Surface texture");
+    ui.checkbox(&mut road.paint_surface, "Paint a surface")
+        .on_hover_text("Paint a texture down the middle of the road.");
+    if road.paint_surface {
+        road_texture(ui, thumbnails, &road.surface.texture, &mut road.surface.effect_id);
+        theme::row(ui, "width", |ui| {
+            ui.add(egui::Slider::new(&mut road.surface.width, 0.5..=60.0).fixed_decimals(1).suffix(" y"))
+                .on_hover_text("From the centre line to where the texture starts to fade.");
+        });
+        theme::row(ui, "softness", |ui| {
+            ui.add(egui::Slider::new(&mut road.surface.softness, 0.0..=20.0).fixed_decimals(1).suffix(" y"))
+                .on_hover_text("How far past its width the texture fades out.");
+        });
+        theme::row(ui, "opacity", |ui| {
+            ui.add(egui::Slider::new(&mut road.surface.opacity, 0.05..=1.0).fixed_decimals(2))
+                .on_hover_text("How visible the texture is where it is solid.");
+        });
+        theme::row(ui, "wear", |ui| {
+            ui.add(egui::Slider::new(&mut road.surface.wear, 0.0..=0.9).fixed_decimals(2))
+                .on_hover_text(
+                    "How much of the surface is left unpainted in patches, so the ground \
+                     under it shows through. Zero is solid.",
+                );
+        });
+    }
+
+    ui.add_space(6.0);
+    theme::heading(ui, "Verge texture");
+    ui.checkbox(&mut road.paint_verge, "Paint a verge")
+        .on_hover_text(
+            "Paint a second texture in a band along both sides of the surface, starting \
+             under the surface's fade.",
+        );
+    if road.paint_verge {
+        road_texture(ui, thumbnails, &road.verge.texture, &mut road.verge.effect_id);
+        theme::row(ui, "width", |ui| {
+            ui.add(egui::Slider::new(&mut road.verge.width, 0.5..=40.0).fixed_decimals(1).suffix(" y"))
+                .on_hover_text("How far the band reaches past the surface's width.");
+        });
+        theme::row(ui, "softness", |ui| {
+            ui.add(egui::Slider::new(&mut road.verge.softness, 0.0..=20.0).fixed_decimals(1).suffix(" y"))
+                .on_hover_text("How far past its width the band's outer edge fades out.");
+        });
+        theme::row(ui, "opacity", |ui| {
+            ui.add(egui::Slider::new(&mut road.verge.opacity, 0.05..=1.0).fixed_decimals(2))
+                .on_hover_text("How visible the texture is where it is solid.");
+        });
+    }
+
+    if road.paint_surface || road.paint_verge {
+        ui.add_space(6.0);
+        theme::heading(ui, "Edges");
+        theme::row(ui, "ragged", |ui| {
+            ui.add(egui::Slider::new(&mut road.ragged, 0.0..=5.0).fixed_decimals(1).suffix(" y"))
+                .on_hover_text("How far the painted edges wander in and out of a smooth line. Zero is smooth.");
+        });
+        theme::row(ui, "grain", |ui| {
+            ui.add(egui::Slider::new(&mut road.grain, 1.0..=40.0).fixed_decimals(0).suffix(" y"))
+                .on_hover_text("The size, in yards, of one wander of the edges and of one patch of wear.");
+        });
+        ui.checkbox(&mut road.reuse_hidden, "Reuse a hidden layer").on_hover_text(
+            "When a chunk already has four textures, give the road's texture the layer \
+             that shows least, if it shows almost nothing. Off: such a chunk is not painted.",
+        );
+    }
+
+    ui.add_space(6.0);
+    if theme::primary(ui, "Apply road").clicked() {
+        road::apply_and_report(session, road);
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(!road.points.is_empty(), egui::Button::new("Remove last point"))
+            .clicked()
+        {
+            road.points.pop();
+        }
+        if ui
+            .add_enabled(!road.points.is_empty(), egui::Button::new("Clear points"))
+            .clicked()
+        {
+            road.clear();
+        }
+    });
+    if !road.said.is_empty() {
+        ui.add_space(4.0);
+        theme::note(ui, road.said.clone());
+    }
+
+    // The tileset list, which sets whichever of the two textures is chosen
+    // above it.
+    if road.paint_surface || road.paint_verge {
+        ui.add_space(6.0);
+        theme::heading(ui, "Tilesets");
+        theme::segmented(
+            ui,
+            &mut road.slot,
+            &[("Set surface", Slot::Surface), ("Set verge", Slot::Verge)],
+            |a, b| a == b,
+        );
+        if ui
+            .add_enabled(
+                !textures.brush.texture.is_empty(),
+                egui::Button::new("Use the Textures tool's texture"),
+            )
+            .on_hover_text("Set the chosen texture to the one on the Textures tool's brush.")
+            .clicked()
+        {
+            road.choose(textures.brush.texture.clone(), textures.brush.effect_id);
+        }
+        let chosen = match road.slot {
+            Slot::Surface => road.surface.texture.clone(),
+            Slot::Verge => road.verge.texture.clone(),
+        };
+        if let Some(Some(path)) = tileset_browser(ui, textures, thumbnails, &chosen) {
+            // A road texture grows nothing unless asked: grass down the
+            // middle of a road is rarely what was meant. The ground effect is
+            // set beside the texture.
+            road.choose(path, 0);
+        }
+    }
+}
+
+/// One of the road's textures: its picture and name, and its ground effect.
+fn road_texture(ui: &mut egui::Ui, thumbnails: &mut Thumbnails, path: &str, effect_id: &mut u32) {
+    if path.is_empty() {
+        theme::note(ui, "no texture chosen; choose one in the tileset list below");
+        return;
+    }
+    ui.horizontal(|ui| {
+        swatch(ui, thumbnails, path);
+        ui.add(egui::Label::new(egui::RichText::new(textures::leaf(path)).color(theme::INK)).truncate())
+            .on_hover_text(path.to_string());
+    });
+    theme::row(ui, "ground effect", |ui| {
+        ui.add(egui::DragValue::new(effect_id).speed(1.0).range(0..=u32::MAX))
+            .on_hover_text(
+                "MCLY effectId for a layer the road adds: the GroundEffectTexture row \
+                 whose doodads grow on it. 0 grows none.",
+            );
+    });
 }
 
 /// The height brush.
@@ -2924,7 +3254,7 @@ fn brush(ui: &mut egui::Ui, terrain: &mut Terrain) {
         });
         theme::note(
             ui,
-            "how wide a bump is; under 4 yd is below the vertex grid",
+            "noise feature size; under 4 yd is finer than the vertex grid",
         );
     }
 
@@ -2935,7 +3265,7 @@ fn brush(ui: &mut egui::Ui, terrain: &mut Terrain) {
     ui.add_space(4.0);
     theme::heading(ui, "Shape");
     theme::segmented(ui, &mut terrain.brush.shape, &SHAPES, |a, b| a == b);
-    theme::note(ui, "a square follows the chunk grid");
+    theme::note(ui, "the square shape is aligned to the chunk grid");
 
     if matches!(terrain.brush.mode, Mode::Flatten { .. }) {
         flatten_panel(ui, terrain);
@@ -2945,12 +3275,20 @@ fn brush(ui: &mut egui::Ui, terrain: &mut Terrain) {
     theme::heading(ui, "Objects");
     objects_follow(ui, &mut terrain.objects_follow);
 
-    // The selection, while there is one: how a stroke treats it. The rest
-    // of what is done with it is on the Select vertices half.
-    if terrain.selected > 0 {
+    // The selection, while there is one, and the locks, while there are any.
+    // What is done with either is on the Select vertices half.
+    if terrain.selected > 0 || terrain.locked > 0 {
         ui.add_space(4.0);
-        theme::heading(ui, "Selected vertices");
-        vertex_mask(ui, terrain);
+        theme::heading(ui, "Vertices");
+        if terrain.selected > 0 {
+            only_inside(ui, terrain);
+        }
+        if terrain.locked > 0 {
+            theme::note(
+                ui,
+                format!("{} locked on the open tiles; strokes leave them in place", terrain.locked),
+            );
+        }
     }
 
     ui.add_space(6.0);
@@ -2969,7 +3307,7 @@ fn flatten_panel(ui: &mut egui::Ui, terrain: &mut Terrain) {
     ui.add_space(4.0);
     theme::heading(ui, "Flatten to");
     ui.checkbox(&mut terrain.flatten_to_cursor, "height under the pointer")
-        .on_hover_text("Taken where the stroke starts. Off: the height below.");
+        .on_hover_text("Sampled where the stroke starts. Off: the height set below.");
     if !terrain.flatten_to_cursor {
         theme::row(ui, "height", |ui| {
             ui.add(
@@ -3042,27 +3380,75 @@ fn compass(bearing: f32) -> &'static str {
     POINTS[((bearing.rem_euclid(360.0) / 45.0).round() as usize) % 8]
 }
 
-/// How brush strokes treat the selection.
-fn vertex_mask(ui: &mut egui::Ui, terrain: &mut Terrain) {
-    use vale_edit::ops::vertices::Mask;
-    ui.label(egui::RichText::new("Brush strokes").color(theme::INK_DIM));
-    theme::segmented(
-        ui,
-        &mut terrain.mask,
-        &[
-            ("Anywhere", None),
-            ("Outside", Some(Mask::Protect)),
-            ("Inside", Some(Mask::Confine)),
-        ],
-        |a, b| a == b,
+/// Whether brush strokes move only the selected vertices.
+fn only_inside(ui: &mut egui::Ui, terrain: &mut Terrain) {
+    ui.checkbox(&mut terrain.only_inside, "Only inside the selection").on_hover_text(
+        "On: a brush stroke moves the selected vertices and nothing else, and the \
+         selection is drawn green. Off: strokes move any vertex under the brush that \
+         is not locked. To keep vertices from moving, lock them.",
     );
+}
+
+/// The locked vertices: how many the open tiles hold, and the four ways to
+/// change them.
+fn vertex_locks(ui: &mut egui::Ui, terrain: &mut Terrain) {
+    use crate::tools::terrain::VertexAsk;
+    let any = terrain.selected > 0;
     theme::note(
         ui,
-        match terrain.mask {
-            None => "strokes ignore the selection",
-            Some(Mask::Protect) => "strokes leave the selection alone (red)",
-            Some(Mask::Confine) => "strokes only move the selection (green)",
+        match terrain.locked {
+            0 => "none on the open tiles".to_string(),
+            n => format!("{n} on the open tiles, drawn red"),
         },
+    );
+    ui.horizontal_wrapped(|ui| {
+        for (label, ask, about, enabled) in [
+            (
+                "Lock selection",
+                VertexAsk::Lock,
+                "Add the selected vertices to their tiles' locked vertices.",
+                any,
+            ),
+            (
+                "Unlock selection",
+                VertexAsk::Unlock,
+                "Remove the selected vertices from their tiles' locked vertices.",
+                any,
+            ),
+            (
+                "Lock tile sides",
+                VertexAsk::LockSides,
+                "Lock the vertices on all four sides of each tile that holds part of the \
+                 selection. A tile's side is shared with the tile beside it, so this keeps \
+                 the ground at the seam level with a tile that is not being edited.",
+                any,
+            ),
+            (
+                "Unlock all",
+                VertexAsk::UnlockAll,
+                "Unlock every vertex of every open tile.",
+                terrain.locked > 0,
+            ),
+        ] {
+            let disabled_why = match ask {
+                VertexAsk::UnlockAll => "No vertex on the open tiles is locked.",
+                _ => "Select some vertices first.",
+            };
+            if ui
+                .add_enabled(enabled, egui::Button::new(label))
+                .on_hover_text(about)
+                .on_disabled_hover_text(disabled_why)
+                .clicked()
+            {
+                terrain.ask = Some(ask);
+            }
+        }
+    });
+    theme::note(
+        ui,
+        "no height operation moves a locked vertex: brush strokes, Grade, Stitch, \
+         chunk paste, height import, and Level, Smooth, Tilt and height here. Locks \
+         are saved in the project at once and are not on the undo history.",
     );
 }
 
@@ -3150,7 +3536,7 @@ fn vertex_panel(ui: &mut egui::Ui, terrain: &mut Terrain) {
         terrain.ask = Some(VertexAsk::Tilt);
     }
     ui.checkbox(&mut terrain.tilt_flat, "flatten onto the slope")
-        .on_hover_text("Off: the selection leans and keeps its bumps. On: it becomes a flat ramp.");
+        .on_hover_text("Off: the selection tilts and keeps its relief. On: it becomes a flat plane at the tilt.");
     theme::note(
         ui,
         match any {
@@ -3160,13 +3546,17 @@ fn vertex_panel(ui: &mut egui::Ui, terrain: &mut Terrain) {
     );
 
     ui.add_space(4.0);
+    theme::heading(ui, "Locked vertices");
+    vertex_locks(ui, terrain);
+
+    ui.add_space(4.0);
     theme::heading(ui, "Brush");
-    vertex_mask(ui, terrain);
+    only_inside(ui, terrain);
     objects_follow(ui, &mut terrain.objects_follow);
 
     ui.add_space(6.0);
     theme::heading(ui, "Keys");
-    theme::note(ui, "left button selects \u{b7} with shift, takes out");
+    theme::note(ui, "left button selects \u{b7} with shift, deselects");
     theme::note(ui, "ctrl + wheel resizes the footprint");
     theme::note(ui, "shift + 1 \u{b7} 2 \u{b7} 3 pick the shape");
 }
@@ -3175,12 +3565,11 @@ fn vertex_panel(ui: &mut egui::Ui, terrain: &mut Terrain) {
 /// the ground is carried when the ground moves. One function, so the two
 /// panels word it alike.
 fn objects_follow(ui: &mut egui::Ui, on: &mut bool) {
-    ui.checkbox(on, "Objects follow the ground").on_hover_text(
-        "When the ground moves, every doodad and building over it is raised or lowered \
-         by as much, in the same undo entry, so a tree stays on a hill that was raised \
-         under it. Off, a placement keeps the height in its record and the ground \
-         moves through it. Creature and object spawns are rows of the server's \
-         database and are not moved.",
+    ui.checkbox(on, "Doodads and WMOs follow the ground").on_hover_text(
+        "When the ground moves, every doodad and WMO on it moves up or down by the \
+         same amount, in the same undo entry. Off: placements keep their stored \
+         height and the ground moves through them. Creature and game object spawns \
+         are rows in the world database and are not moved.",
     );
 }
 
@@ -3211,7 +3600,7 @@ fn shading(ui: &mut egui::Ui, shading: &mut crate::tools::shading::Shading) {
                 ui.color_edit_button_rgb(&mut shading.picked);
             });
         }
-        _ => theme::note(ui, "this mode chooses its own colour"),
+        _ => theme::note(ui, "this mode sets its own colour"),
     }
     theme::row(ui, "brightness", |ui| {
         ui.add(
@@ -3228,7 +3617,7 @@ fn shading(ui: &mut egui::Ui, shading: &mut crate::tools::shading::Shading) {
     theme::note(
         ui,
         format!(
-            "aims at {:.2}, {:.2}, {:.2}; 1.00 leaves a vertex unchanged",
+            "target {:.2}, {:.2}, {:.2}; 1.00 leaves a vertex unchanged",
             aim[0], aim[1], aim[2]
         ),
     );
@@ -3288,9 +3677,9 @@ fn shading(ui: &mut egui::Ui, shading: &mut crate::tools::shading::Shading) {
     theme::heading(ui, "About");
     theme::note(
         ui,
-        "MCCV is a per-vertex multiplier the reference client does not read. \
-         A chunk painted back to neutral loses the region, so an undone tile \
-         writes back byte for byte.",
+        "MCCV is a per-vertex colour multiplier; the reference client does not \
+         read it. A chunk painted back to neutral drops its MCCV data, so an \
+         undone tile is written back byte for byte.",
     );
 }
 
@@ -3354,11 +3743,11 @@ fn paint(
                     .suffix("%"),
             )
             .on_hover_text(
-                "How visible the texture is where a held stroke ends up. At 100% the \
-                 stroke converges on the texture alone; at 60% on the texture at 60% \
-                 over what is under it, from either side.",
+                "The texture's opacity at the end of a held stroke. At 100% the \
+                 stroke converges on the texture alone; at 60%, on the texture at 60% \
+                 over what is beneath it, from either side.",
             )
-            .on_disabled_hover_text("An eraser takes the texture to nothing.");
+            .on_disabled_hover_text("Erase always reduces the texture to 0%.");
         if response.changed() {
             textures.brush.opacity = percent / 100.0;
         }
@@ -3370,6 +3759,9 @@ fn paint(
                 .speed(0.01)
                 .range(crate::tools::CORE)
                 .fixed_decimals(2),
+        )
+        .on_hover_text(
+            "The share of the radius painted at full strength, drawn as the inner              ring. Outside it the paint fades along the falloff to nothing at the              outer ring, and a held stroke goes no further than that fade.",
         );
     });
 
@@ -3403,9 +3795,9 @@ fn paint(
                     .suffix("%"),
             )
             .on_hover_text(
-                "How much of the ground under the brush is painted. At 100% the stroke \
-                 is solid. Below it the stroke paints in patches, the same patches for \
-                 as long as it is held, which breaks one texture up into another.",
+                "The share of the ground under the brush that is painted. At 100% the \
+                 stroke is solid. Below 100% it paints in patches that stay fixed while \
+                 the button is held, to break up the edge between two textures.",
             )
             .changed()
         {
@@ -3434,21 +3826,21 @@ fn paint(
     theme::heading(ui, "Four-texture limit");
     ui.checkbox(&mut textures.brush.existing_only, "Paint existing layers only")
         .on_hover_text(
-            "Leave a chunk that does not carry the texture alone. A stroke then changes \
-             how the textures blend and never adds one to a chunk.",
+            "Skip chunks that do not carry the texture. A stroke then changes only \
+             the blend of existing layers and never adds a layer.",
         );
     ui.add_enabled(
         !textures.brush.existing_only && !textures.brush.erase,
         egui::Checkbox::new(&mut textures.brush.reuse_hidden, "Reuse a hidden layer"),
     )
     .on_hover_text(
-        "When a chunk already has four textures, give this one the layer that shows \
-         least, if it shows under 2% of the chunk. Otherwise the stroke is refused \
-         there, and the Chunk list below shows which four it has.",
+        "When a chunk already has four textures, replace the least visible layer \
+         if it covers under 2% of the chunk. Otherwise the stroke is refused on \
+         that chunk, and the Chunk list below shows its four textures.",
     )
     .on_disabled_hover_text("Only a stroke that may add a texture can reuse a layer.");
     ui.checkbox(&mut guides.layers, "Show full chunks").on_hover_text(
-        "Wash red the chunks that carry four textures. The same switch as Full chunks \
+        "Tint red the chunks that carry four textures. The same switch as Full chunks \
          in the view bar's Guides menu.",
     );
 
@@ -3495,33 +3887,27 @@ fn tileset_chosen(
             // `effectId`. It is set, when the texture is chosen, from what the
             // open ground pairs this texture with, and can be edited here. See
             // `PaintBrush::effect_id`.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("grows")
-                        .size(theme::SMALL)
-                        .color(theme::INK_DIM),
-                );
-                ui.add(
-                    egui::DragValue::new(&mut textures.brush.effect_id)
-                        .speed(1.0)
-                        .range(0..=u32::MAX),
-                )
-                .on_hover_text(
-                    "The GroundEffectTexture row a new layer of this texture \
-                     plants foliage from. Zero grows nothing. Set from what \
-                     the open ground already grows on this texture when it \
-                     is picked.",
-                );
-                if ui
-                    .small_button("usual")
-                    .on_hover_text("What the open tiles grow on this texture, most often.")
-                    .clicked()
-                {
-                    textures.brush.effect_id =
-                        textures::usual_effect(session, &chosen).unwrap_or(0);
-                }
-            });
-            theme::note(ui, grows(assets, textures.brush.effect_id));
+            theme::row_about(
+                ui,
+                "foliage",
+                "What a new layer of this texture grows: MCLY effectId, a \
+                 GroundEffectTexture row. Set, when the texture is chosen, to what \
+                 the open tiles grow on it most.",
+                |ui| {
+                    let picked = ground_effect(
+                        ui,
+                        "brush",
+                        textures.brush.effect_id,
+                        true,
+                        session,
+                        &chosen,
+                        assets,
+                    );
+                    if let Some(id) = picked {
+                        textures.brush.effect_id = id;
+                    }
+                },
+            );
         }
     }
 }
@@ -3539,6 +3925,30 @@ fn tileset_picker(
     thumbnails: &mut Thumbnails,
     session: &EditSession,
 ) -> bool {
+    let chosen = textures.brush.texture.clone();
+    let Some(picked) = tileset_browser(ui, textures, thumbnails, &chosen) else {
+        return false;
+    };
+    if let Some(path) = picked {
+        // Picking a texture also sets its foliage, from the ground already
+        // painted with it. A texture on which no open layer grows anything
+        // grows nothing, which matches the shipped ground.
+        textures.brush.effect_id = textures::usual_effect(session, &path).unwrap_or(0);
+        textures.brush.texture = path;
+    }
+    true
+}
+
+/// The search box and the tileset list by folder, with `chosen` marked.
+/// Answers the path clicked this frame, or `None` while the list is still
+/// being read. The search and the open folder are the texture tool's, so
+/// every list opens where the last one was left.
+fn tileset_browser(
+    ui: &mut egui::Ui,
+    textures: &mut Textures,
+    thumbnails: &mut Thumbnails,
+    chosen: &str,
+) -> Option<Option<String>> {
     ui.add(
         egui::TextEdit::singleline(&mut textures.search)
             .hint_text("search the tilesets")
@@ -3546,7 +3956,7 @@ fn tileset_picker(
     );
     if !textures.catalogue.iter().any(|path| !path.is_empty()) {
         theme::note(ui, "reading the tileset list…");
-        return false;
+        return None;
     }
     // Folders, as in the model picker. `Tileset\Elwynn\` is the set a zone was
     // painted with, and with six hundred names in one scroller every one has
@@ -3573,7 +3983,7 @@ fn tileset_picker(
             .show(ui, |ui| {
                 go = folder_rows(ui, &here, &folders, row).or(go.take());
                 for path in &files {
-                    if texture_row(ui, thumbnails, path, &textures.brush.texture) {
+                    if texture_row(ui, thumbnails, path, chosen) {
                         picked = Some(path.clone());
                     }
                 }
@@ -3605,20 +4015,13 @@ fn tileset_picker(
             .auto_shrink([false, true])
             .show_rows(ui, row, matches.len(), |ui, range| {
                 for path in &matches[range] {
-                    if texture_row(ui, thumbnails, path, &textures.brush.texture) {
+                    if texture_row(ui, thumbnails, path, chosen) {
                         picked = Some(path.clone());
                     }
                 }
             });
     }
-    if let Some(path) = picked {
-        // Picking a texture also sets its foliage, from the ground already
-        // painted with it. A texture on which no open layer grows anything
-        // grows nothing, which matches the shipped ground.
-        textures.brush.effect_id = textures::usual_effect(session, &path).unwrap_or(0);
-        textures.brush.texture = path;
-    }
-    true
+    Some(picked)
 }
 
 /// One row of the tileset list: a picture, a name, and whether it was clicked.
@@ -3762,8 +4165,8 @@ fn chunk_layers(
     theme::heading(ui, "Chunk");
     let pinned = textures.pinned.is_some();
     let Some((coord, chunk)) = textures::shown(textures, cursor) else {
-        theme::note(ui, "the pointer is over no ground");
-        theme::note(ui, "space pins the chunk under it");
+        theme::note(ui, "pointer is not over the ground");
+        theme::note(ui, "space pins the chunk under the pointer");
         return;
     };
     let Some(layers) = textures::layers_of(session, coord, chunk) else {
@@ -3774,7 +4177,7 @@ fn chunk_layers(
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(match pinned {
-                true => "PINNED",
+                true => "pinned",
                 false => "following the pointer",
             })
             .size(theme::SMALL)
@@ -3790,9 +4193,9 @@ fn chunk_layers(
                     false => "Pin",
                 })
                 .on_hover_text(
-                    "Space, over the chunk. A pinned chunk stays in this panel \
-                     while the pointer moves to the buttons. Without it, reaching \
-                     a button moves the pointer off the chunk.",
+                    "Space over a chunk. A pinned chunk stays in this panel \
+                     while the pointer moves to the buttons. Unpinned, the panel \
+                     follows the pointer.",
                 )
                 .clicked()
             {
@@ -3826,152 +4229,100 @@ fn chunk_layers(
         true => None,
         false => Some(textures.brush.texture.clone()),
     };
+    let mut using: Option<(String, u32)> = None;
     for (index, layer) in layers.iter().enumerate() {
+        if index > 0 {
+            ui.add_space(6.0);
+        }
         ui.horizontal(|ui| {
             swatch(ui, thumbnails, &layer.texture);
             ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new(textures::leaf(&layer.texture))
-                        .size(theme::SMALL)
-                        .color(theme::INK),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(textures::leaf(&layer.texture))
+                            .size(theme::SMALL)
+                            .color(theme::INK),
+                    )
+                    .truncate(),
                 )
                 .on_hover_text(layer.texture.clone());
                 // The base is the one layer with no blend map and cannot be
                 // removed, so it is labelled "base" instead of showing a
-                // coverage it cannot change.
-                theme::note(
-                    ui,
-                    match index {
-                        0 => "base".to_string(),
-                        _ => format!("{:.0}% visible", layer.coverage * 100.0),
-                    },
-                );
-                // The layer's foliage, editable: the `MCLY` field no brush
-                // writes. The number is the table row; the note names what
-                // the row plants, for a reader who does not know the table.
+                // coverage it cannot change. The row's buttons share the line.
                 ui.horizontal(|ui| {
-                    let mut effect = layer.effect_id;
-                    let response = ui
-                        .add_enabled(
-                            pinned,
-                            egui::DragValue::new(&mut effect)
-                                .speed(1.0)
-                                .range(0..=u32::MAX),
-                        )
-                        .on_hover_text(
-                            "GroundEffectTexture row this layer plants foliage from; \
-                             zero grows nothing.",
-                        )
-                        .on_disabled_hover_text("Pin the chunk (press Space over it).");
-                    if response.changed() {
-                        grow = Some((index, effect));
-                    }
-                    if ui
-                        .add_enabled(pinned, egui::Button::new("usual").small())
-                        .on_hover_text("What the open tiles grow on this texture, most often.")
-                        .clicked()
-                    {
-                        if let Some(id) = textures::usual_effect(session, &layer.texture) {
-                            grow = Some((index, id));
-                        }
-                    }
-                    theme::note(ui, grows(assets, layer.effect_id));
+                    theme::note(
+                        ui,
+                        match index {
+                            0 => "base".to_string(),
+                            _ => format!("{:.0}% visible", layer.coverage * 100.0),
+                        },
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        layer_buttons(ui, index, pinned, chosen.is_some(), &mut |ask| match ask {
+                            LayerAsk::Drop => drop = Some(index),
+                            LayerAsk::Swap => swap = Some((index, chosen.clone().unwrap_or_default())),
+                            LayerAsk::Rebase => rebase = chosen.clone(),
+                            LayerAsk::Use => using = Some((layer.texture.clone(), layer.effect_id)),
+                        });
+                    });
                 });
-                // The layer's texture animation: the last field of the record
-                // that no other control writes. Three controls, because the
-                // file stores three values: a switch, one of eight directions
-                // and one of eight speeds. The note states them in words: only
-                // 164 layers in Azeroth carry these bits, all of them lava, so
-                // the meaning of the numbers (direction 2 is east) is not
-                // commonly known.
-                ui.horizontal(|ui| {
-                    let (mut turn, mut rate, mut on) = layer.animation;
+            });
+        });
+        // The layer's foliage and animation, under the name: the two `MCLY`
+        // fields no brush writes. Disabled while the chunk follows the
+        // pointer, for the reason the buttons are.
+        let picked = theme::row_about(
+            ui,
+            "foliage",
+            "MCLY effectId: what this layer grows, a GroundEffectTexture row.",
+            |ui| {
+                ground_effect(
+                    ui,
+                    &format!("layer {index}"),
+                    layer.effect_id,
+                    pinned,
+                    session,
+                    &layer.texture,
+                    assets,
+                )
+            },
+        );
+        if let Some(id) = picked {
+            grow = Some((index, id));
+        }
+        // Only 164 layers in Azeroth are animated, all of them lava, so the
+        // direction and speed are shown only once the switch is on.
+        theme::row_about(
+            ui,
+            "animation",
+            "MCLY texture animation: scrolls this layer's texture coordinates, as on \
+             the Burning Steppes lava.",
+            |ui| {
+                let (mut turn, mut rate, mut on) = layer.animation;
+                ui.add_enabled_ui(pinned, |ui| {
                     let mut moved = ui
-                        .add_enabled(pinned, egui::Checkbox::new(&mut on, "crawls"))
-                        .on_hover_text(
-                            "MCLY's texture animation: scrolls this layer's UVs. \
-                             What makes the Burning Steppes lava move.",
-                        )
+                        .checkbox(&mut on, "scrolls")
                         .on_disabled_hover_text("Pin the chunk (press Space over it).")
                         .changed();
-                    moved |= ui
-                        .add_enabled(
-                            pinned && on,
-                            egui::DragValue::new(&mut turn).speed(0.1).range(0..=7),
-                        )
-                        .on_hover_text("Direction, 0..7 — each step is 45° clockwise from north.")
-                        .changed();
-                    moved |= ui
-                        .add_enabled(
-                            pinned && on,
-                            egui::DragValue::new(&mut rate).speed(0.1).range(0..=7),
-                        )
-                        .on_hover_text("Speed, 0..7 — each step doubles it.")
-                        .changed();
+                    if on {
+                        moved |= crawl_direction(ui, index, &mut turn);
+                        moved |= ui
+                            .add(egui::DragValue::new(&mut rate).speed(0.1).range(0..=7).prefix("speed "))
+                            .on_hover_text("0 to 7: each step doubles it.")
+                            .changed();
+                        theme::note(ui, crawls((turn, rate, on)));
+                    }
                     if moved {
                         crawl = Some((index, turn, rate, on));
                     }
-                    theme::note(ui, crawls(layer.animation));
                 });
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if index == 0 {
-                    // The base is replaced, never removed; see
-                    // `Paint::set_base`. It is the one layer a brush cannot
-                    // change: painting adds a layer over it, and a chunk at the
-                    // four-layer limit cannot add even that.
-                    if ui
-                        .add_enabled(pinned && chosen.is_some(), egui::Button::new("↧").small())
-                        .on_hover_text(
-                            "Make the chosen texture this chunk's base, under everything \
-                             already painted on it. Every blend map is kept.",
-                        )
-                        .on_disabled_hover_text(
-                            "Pin the chunk (press Space over it) and choose a texture below.",
-                        )
-                        .clicked()
-                    {
-                        rebase = chosen.clone();
-                    }
-                    return;
-                }
-                // Disabled rather than hidden while the chunk follows the
-                // pointer, because a press would act on whichever chunk the
-                // pointer crossed on the way to the button, with no indication
-                // that it was the wrong chunk. The tooltip says so.
-                if ui
-                    .add_enabled(
-                        pinned && chosen.is_some(),
-                        egui::Button::new("swap").small(),
-                    )
-                    .on_hover_text(
-                        "Make this layer draw the chosen texture instead, keeping its \
-                         blend map. The way through a full chunk that throws nothing away.",
-                    )
-                    .on_disabled_hover_text(
-                        "Pin the chunk (press Space over it) and choose a texture below.",
-                    )
-                    .clicked()
-                {
-                    swap = Some((index, chosen.clone().unwrap_or_default()));
-                }
-                if ui
-                    .add_enabled(pinned, egui::Button::new("×").small())
-                    .on_hover_text(
-                        "Take this layer off the chunk, freeing a slot for another \
-                         texture. Removing a layer at 0% changes nothing on screen.",
-                    )
-                    .on_disabled_hover_text(
-                        "Pin the chunk first (press Space over it). Otherwise this \
-                         acts on whatever chunk the pointer reached on the way to \
-                         the button.",
-                    )
-                    .clicked()
-                {
-                    drop = Some(index);
-                }
-            });
-        });
+            },
+        );
+    }
+    if let Some((path, effect_id)) = using {
+        textures.brush.effect_id = effect_id;
+        session.status = format!("painting with {}", textures::leaf(&path));
+        textures.brush.texture = path;
     }
     if let Some(index) = drop {
         textures::drop_layer(session, coord, chunk, index);
@@ -3997,7 +4348,7 @@ fn chunk_layers(
                 pinned && layers.len() > 1,
                 egui::Button::new("Clear to base"),
             )
-            .on_hover_text("Takes every layer off this chunk but the base.")
+            .on_hover_text("Removes every layer from this chunk except the base.")
             .clicked()
         {
             textures::clear_paint(session, coord, chunk);
@@ -4013,7 +4364,7 @@ fn chunk_layers(
         {
             if let Some(path) = chosen.clone() {
                 let changed = textures::set_tile_base(session, coord, &path);
-                session.status = format!("{changed} chunks re-based on {}", textures::leaf(&path));
+                session.status = format!("base texture of {changed} chunks set to {}", textures::leaf(&path));
             }
         }
     });
@@ -4021,10 +4372,196 @@ fn chunk_layers(
         ui.add_space(2.0);
         theme::note(
             ui,
-            "This chunk is full. A fifth texture cannot be painted on it until \
-             one of these comes off.",
+            "This chunk has four textures, the maximum. Remove or swap a layer \
+             to paint a different texture.",
         );
     }
+}
+
+/// What a layer row's buttons asked for.
+enum LayerAsk {
+    /// Paint with the layer's texture and ground effect.
+    Use,
+    /// Replace the layer's texture with the chosen one.
+    Swap,
+    /// Make the chosen texture the chunk's base.
+    Rebase,
+    /// Remove the layer.
+    Drop,
+}
+
+/// A layer row's buttons, right to left: remove, swap (or set the base, on
+/// the base) and use.
+///
+/// Use is always available, since it changes the brush and not the chunk. The
+/// others are disabled rather than hidden while the chunk follows the pointer,
+/// because a press would act on whichever chunk the pointer crossed on the
+/// way to the button, with no sign that it was the wrong one.
+fn layer_buttons(
+    ui: &mut egui::Ui,
+    index: usize,
+    pinned: bool,
+    chosen: bool,
+    asked: &mut dyn FnMut(LayerAsk),
+) {
+    let unpinned = "Pin the chunk first (press Space over it). Unpinned, this would act on \
+                    the last chunk the pointer crossed on the way to the button.";
+    match index {
+        // The base is replaced, never removed; see `Paint::set_base`.
+        0 => {
+            if ui
+                .add_enabled(pinned && chosen, egui::Button::new("Set base").small())
+                .on_hover_text(
+                    "Make the chosen texture this chunk's base, under everything already \
+                     painted on it. Every blend map is kept.",
+                )
+                .on_disabled_hover_text("Pin the chunk (press Space over it) and choose a texture.")
+                .clicked()
+            {
+                asked(LayerAsk::Rebase);
+            }
+        }
+        _ => {
+            if ui
+                .add_enabled(pinned, egui::Button::new("×").small())
+                .on_hover_text(
+                    "Remove this layer from the chunk, freeing a slot for another texture. \
+                     Removing a layer at 0% changes nothing on screen.",
+                )
+                .on_disabled_hover_text(unpinned)
+                .clicked()
+            {
+                asked(LayerAsk::Drop);
+            }
+            if ui
+                .add_enabled(pinned && chosen, egui::Button::new("Swap").small())
+                .on_hover_text(
+                    "Replace this layer's texture with the chosen texture, keeping its blend \
+                     map. On a full chunk this changes a texture without removing a layer.",
+                )
+                .on_disabled_hover_text("Pin the chunk (press Space over it) and choose a texture.")
+                .clicked()
+            {
+                asked(LayerAsk::Swap);
+            }
+        }
+    }
+    if ui
+        .button(egui::RichText::new("Use").size(theme::SMALL))
+        .on_hover_text("Paint with this texture: it becomes the brush's, with this layer's foliage.")
+        .clicked()
+    {
+        asked(LayerAsk::Use);
+    }
+}
+
+/// A layer's animation direction as a compass point, from `MCLY`'s 0 to 7:
+/// step 0 is north (up the texture) and each step 45° clockwise. Returns
+/// whether it changed.
+fn crawl_direction(ui: &mut egui::Ui, index: usize, turn: &mut u32) -> bool {
+    const COMPASS: [&str; 8] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+    let was = *turn;
+    egui::ComboBox::from_id_salt(("layer-direction", index))
+        .selected_text(COMPASS[(*turn & 7) as usize])
+        .width(48.0)
+        .show_ui(ui, |ui| {
+            for (step, name) in COMPASS.iter().enumerate() {
+                ui.selectable_value(turn, step as u32, *name);
+            }
+        })
+        .response
+        .on_hover_text("Which way the texture crawls.");
+    *turn != was
+}
+
+/// **A ground effect, chosen by what it grows** rather than typed as a
+/// `GroundEffectTexture` row id. Returns the row picked this frame.
+///
+/// The list offers nothing, then the effects the open tiles grow on this
+/// texture, most used first, then the ones they grow on other textures. Each
+/// is named by its models (see [`grows`]). Neither table names a texture, so
+/// the open ground is the only record of which effect suits which, and a zone
+/// generally reuses a handful. A row id the open tiles do not use can still be
+/// typed at the bottom.
+///
+/// The counts read every open chunk. Worked out every frame the list was
+/// open, they took the editor to a crawl, so they are worked out on the frame
+/// it opens and kept in egui's memory while it stays open.
+fn ground_effect(
+    ui: &mut egui::Ui,
+    salt: &str,
+    current: u32,
+    enabled: bool,
+    session: &EditSession,
+    texture: &str,
+    assets: &vale_client::assets::GameAssets,
+) -> Option<u32> {
+    let mut picked = None;
+    let width = ui.available_width().max(80.0);
+    ui.add_enabled_ui(enabled, |ui| {
+        egui::ComboBox::from_id_salt(("ground-effect", salt))
+            .selected_text(egui::RichText::new(grows(assets, current)).size(theme::SMALL))
+            .width(width)
+            .truncate()
+            .show_ui(ui, |ui| {
+                ui.set_min_width(width.max(260.0));
+                if ui.selectable_label(current == 0, "nothing").clicked() {
+                    picked = Some(0);
+                }
+                let counts = counts_while_open(ui, salt, session, texture);
+                let mut section = |ui: &mut egui::Ui, title: &str, list: &[(u32, usize)]| {
+                    if list.is_empty() {
+                        return;
+                    }
+                    ui.add_space(4.0);
+                    theme::note(ui, title);
+                    for &(id, count) in list.iter().take(20) {
+                        let label = format!("{}  · {count} layers · row {id}", grows(assets, id));
+                        if ui.selectable_label(current == id, label).clicked() {
+                            picked = Some(id);
+                        }
+                    }
+                };
+                section(ui, "grown on this texture in the open tiles", &counts.with);
+                section(ui, "grown on other textures in the open tiles", &counts.elsewhere);
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    theme::note(ui, "another row");
+                    let mut id = current;
+                    if ui
+                        .add(egui::DragValue::new(&mut id).speed(1.0).range(0..=u32::MAX))
+                        .on_hover_text("A GroundEffectTexture row id, for one the open tiles do not use.")
+                        .changed()
+                    {
+                        picked = Some(id);
+                    }
+                });
+            });
+    })
+    .response
+    .on_disabled_hover_text("Pin the chunk (press Space over it).");
+    picked
+}
+
+/// [`textures::effect_counts`] for a list that is open: worked out on the
+/// first frame and kept while the list is drawn on every frame after it, or
+/// again if the texture it was for has changed.
+fn counts_while_open(
+    ui: &egui::Ui,
+    salt: &str,
+    session: &EditSession,
+    texture: &str,
+) -> std::sync::Arc<textures::EffectCounts> {
+    type Kept = (u64, String, std::sync::Arc<textures::EffectCounts>);
+    let id = egui::Id::new(("ground-effect-counts", salt));
+    let pass = ui.ctx().cumulative_pass_nr();
+    let kept = ui.data(|data| data.get_temp::<Kept>(id));
+    let counts = match kept {
+        Some((last, path, counts)) if last + 1 >= pass && path == texture => counts,
+        _ => std::sync::Arc::new(textures::effect_counts(session, texture)),
+    };
+    ui.data_mut(|data| data.insert_temp(id, (pass, texture.to_string(), counts.clone())));
+    counts
 }
 
 /// What the group lines under the Selection heading asked for.
@@ -4036,16 +4573,50 @@ enum Group {
     Clear,
     /// Add every placement of the primary's model in the open tiles.
     AllOfModel,
+    /// Lock every selected placement and drop the selection.
+    Lock,
+    /// Make this member the primary, from the list of members.
+    Primary(u32),
+    /// Take this member out of the group, from the list of members.
+    Drop(u32),
+}
+
+/// How many doodads or WMOs of the map are locked, and a button that unlocks
+/// them all. See `crate::session::PlacementLocks`.
+fn locked_placements(ui: &mut egui::Ui, session: &mut EditSession, kind: Kind) {
+    let noun = match kind {
+        Kind::Doodad => "doodads",
+        Kind::Wmo => "WMOs",
+    };
+    let locked = session.placement_locks().of(kind).len();
+    if locked == 0 {
+        return;
+    }
+    ui.horizontal(|ui| {
+        theme::note(ui, format!("{locked} {noun} locked on this map, marked red"));
+        if ui
+            .small_button("Unlock all")
+            .on_hover_text(format!(
+                "Unlock every locked {} on this map. Right-click one to unlock it alone.",
+                noun.trim_end_matches('s')
+            ))
+            .clicked()
+        {
+            let ids: Vec<u32> = session.placement_locks().of(kind).iter().copied().collect();
+            let n = session.set_placements_locked(kind, ids, false);
+            session.status = format!("unlocked {n} {noun}");
+        }
+    });
 }
 
 /// The lines about a selection of several, above the primary's own numbers:
 /// how many, what they are, and the three buttons that change the group.
 ///
-/// `chosen` is every member's path, the primary first. With one placement or
-/// none this draws only the "Select all of this model" button, which makes a
-/// group of one kind in one press. See `crate::tools::group`.
-fn group(ui: &mut egui::Ui, chosen: &[&str], noun: &str) -> Group {
-    let Some(primary) = chosen.first() else {
+/// `chosen` is every member's unique id and path, the primary first. With one
+/// placement or none this draws only the "Select all of this model" button,
+/// which makes a group of one kind in one press. See `crate::tools::group`.
+fn group(ui: &mut egui::Ui, chosen: &[(u32, &str)], noun: &str) -> Group {
+    let Some(&(_, primary)) = chosen.first() else {
         return Group::Nothing;
     };
     let mut asked = Group::Nothing;
@@ -4058,7 +4629,7 @@ fn group(ui: &mut egui::Ui, chosen: &[&str], noun: &str) -> Group {
         // What the group is made of, most numerous first: a sweep of a forest
         // is thirty of one tree and a hand-picked group is a few of several.
         let mut counts: Vec<(&str, usize)> = Vec::new();
-        for path in chosen {
+        for (_, path) in chosen {
             let leaf = path.rsplit(['\\', '/']).next().unwrap_or(path);
             match counts.iter_mut().find(|(had, _)| had.eq_ignore_ascii_case(leaf)) {
                 Some((_, count)) => *count += 1,
@@ -4074,9 +4645,22 @@ fn group(ui: &mut egui::Ui, chosen: &[&str], noun: &str) -> Group {
         }
         theme::note(
             ui,
-            "The numbers below are the brighter one's. A drag, the handles, the \
-             keys and delete act on all of them.",
+            "The values below are the primary selection's (drawn brighter). \
+             Dragging, the handles, the keys and Delete act on all of them.",
         );
+        let member = |index: usize| {
+            let (id, path) = chosen[index];
+            super::members::Member {
+                id: u64::from(id),
+                label: path.rsplit(['\\', '/']).next().unwrap_or(path).to_string(),
+                detail: id.to_string(),
+            }
+        };
+        match super::members::list(ui, noun, chosen.len(), member) {
+            Some(super::members::Pick::Primary(id)) => asked = Group::Primary(id as u32),
+            Some(super::members::Pick::Drop(id)) => asked = Group::Drop(id as u32),
+            None => {}
+        }
     }
     ui.horizontal_wrapped(|ui| {
         let leaf = primary.rsplit(['\\', '/']).next().unwrap_or(primary);
@@ -4089,10 +4673,21 @@ fn group(ui: &mut egui::Ui, chosen: &[&str], noun: &str) -> Group {
         {
             asked = Group::AllOfModel;
         }
+        if ui
+            .small_button("Lock")
+            .on_hover_text(format!(
+                "Lock the selected {noun}: no tool selects, moves or deletes them, and \
+                 moving the ground does not carry them, until they are unlocked. \
+                 Right-click a locked one to unlock it."
+            ))
+            .clicked()
+        {
+            asked = Group::Lock;
+        }
         if chosen.len() > 1 {
             if ui
-                .small_button("Only this one")
-                .on_hover_text("Keep the brighter one and drop the rest.")
+                .small_button("Select primary only")
+                .on_hover_text("Keep the primary (brighter) selection and deselect the rest.")
                 .clicked()
             {
                 asked = Group::Only;
@@ -4129,16 +4724,19 @@ fn doodad(
         ui,
         match gizmo.handles {
             Handles::Move => "drag an arrow to move along one axis",
-            Handles::Turn => "drag a ring to turn about one",
-            Handles::Off => "no handles: the pointer picks and drags on the ground",
+            Handles::Turn => "drag a ring to turn about one axis",
+            Handles::Off => "no handles: click selects, drag moves along the ground",
         },
     );
 
     ui.add_space(4.0);
     theme::heading(ui, "Selection");
-    let chosen: Vec<&str> = selection.members().map(|at| at.path.as_str()).collect();
+    let chosen: Vec<(u32, &str)> =
+        selection.members().map(|at| (at.unique_id, at.path.as_str())).collect();
     match group(ui, &chosen, "doodads") {
         Group::Nothing => {}
+        Group::Primary(id) => selection.promote(id),
+        Group::Drop(id) => selection.also.retain(|at| at.unique_id != id),
         Group::Only => {
             let primary = selection.at.take();
             selection.only(primary);
@@ -4154,15 +4752,22 @@ fn doodad(
                 session.status = format!("{} selected", selection.count());
             }
         }
+        Group::Lock => {
+            let ids: Vec<u32> = selection.members().map(|at| at.unique_id).collect();
+            let n = session.set_placements_locked(Kind::Doodad, ids, true);
+            selection.only(None);
+            session.status = format!("locked {n} doodads");
+        }
     }
+    locked_placements(ui, session, Kind::Doodad);
     let grouped = selection.count() > 1;
     let Selection { at, align, .. } = &mut *selection;
     let Some(at) = at.as_mut() else {
         theme::note(
             ui,
-            "Click something in the world to select it, or drag a rectangle on \
-             empty ground. Picking tests the model's own triangles rather than \
-             its bounding box, and only a placement that is drawn can be picked.",
+            "Click a doodad in the world to select it, or drag a rectangle on \
+             empty ground. Selection tests the model's triangles rather than \
+             its bounding box, and only visible placements can be selected.",
         );
         theme::note(ui, "tab, or 1 and 2, switch select and place");
         return;
@@ -4231,32 +4836,32 @@ fn doodad(
     let mut each: Option<Lean> = None;
     ui.horizontal(|ui| {
         if ui
-            .small_button("Lean to ground")
+            .small_button("Align to slope")
             .on_hover_text(
-                "Rewrite the two leans so the model stands square to the slope \
-                 under its origin. The turn about z is kept. Over a group, each \
-                 member is leaned to the slope under its own origin.",
+                "Set the rotation about x and y so the model stands perpendicular \
+                 to the slope under its origin. The rotation about z is kept. In a \
+                 group, each member is aligned to the slope under its own origin.",
             )
             .clicked()
         {
             each = Some(Lean::Ground);
             if !crate::tools::doodads::lean_onto_ground(session, at) {
-                session.status = "the origin is over no open ground".to_string();
+                session.status = "the doodad's origin is not over open ground".to_string();
             }
         }
         if ui
             .small_button("Stand upright")
-            .on_hover_text("Clear both leans, keeping the turn. Over a group, every member's.")
+            .on_hover_text("Set the rotation about x and y to zero, keeping the rotation about z. In a group, applies to every member.")
             .clicked()
         {
             each = Some(Lean::Upright);
             crate::tools::doodads::stand_upright(at);
         }
     });
-    ui.checkbox(align, "ctrl-drag also leans it to the ground")
+    ui.checkbox(align, "ctrl-drag also aligns to slope")
         .on_hover_text(
-            "With this on, dropping the placement onto the ground with a \
-             ctrl-drag also leans it onto the slope there.",
+            "A ctrl-drag that drops the doodad onto the ground also aligns \
+             it to the slope there.",
         );
 
     ui.add_space(4.0);
@@ -4264,7 +4869,7 @@ fn doodad(
     // The file stores unit scale as 1024. The panel shows a multiplier and
     // writes the file's number.
     let mut scale = f32::from(at.record.scale) / 1024.0;
-    theme::row(ui, "size", |ui| {
+    theme::row(ui, "scale", |ui| {
         if ui
             .add(
                 egui::DragValue::new(&mut scale)
@@ -4286,9 +4891,9 @@ fn doodad(
     theme::note(ui, "drag to move · ctrl-drag drops it onto the ground");
     theme::note(
         ui,
-        "arrows nudge · page up/down raises · shift is ten times",
+        "arrows nudge · page up/down raises and lowers · shift moves ten times as far",
     );
-    theme::note(ui, ", and . turn about z · alt + mouse sweeps it");
+    theme::note(ui, ", and . turn about z · alt + mouse turns it");
     theme::note(ui, "ctrl + wheel scales · ctrl with alt snaps the turn");
     theme::note(ui, "delete removes it · ctrl+d duplicates");
     theme::note(ui, "shift + click adds or removes one");
@@ -4420,13 +5025,13 @@ fn sweep(
 ) {
     use crate::tools::sweep::{Subject, SUBJECTS};
 
-    theme::heading(ui, "Over the whole map");
+    theme::heading(ui, "Map");
     theme::note(
         ui,
         format!(
-            "{}, {} tiles. Every index in a tile is a position in a path list, \
-             so changing a path changes nothing else: no chunk is repainted and \
-             no placement moves.",
+            "{}, {} tiles. Tiles reference textures and models by index into a \
+             path list, so replacing a path changes nothing else: no chunk is \
+             repainted and no placement moves.",
             session.map,
             session.claimed.len()
         ),
@@ -4437,13 +5042,13 @@ fn sweep(
     ui.add_enabled_ui(!running, |ui| {
         theme::segmented(ui, &mut sweep.subject, &SUBJECTS, |a, b| a == b);
         ui.add_space(4.0);
-        theme::heading(ui, "Replace this path");
+        theme::heading(ui, "Find path");
         ui.add(
             egui::TextEdit::singleline(&mut sweep.from)
                 .hint_text(sweep.subject.root())
                 .desired_width(f32::INFINITY),
         );
-        theme::heading(ui, "…with this one");
+        theme::heading(ui, "Replace with");
         ui.add(
             egui::TextEdit::singleline(&mut sweep.to)
                 .hint_text(match sweep.subject {
@@ -4468,7 +5073,7 @@ fn sweep(
                 "Count how many tiles name this path, and how many times, \
                  without changing anything.",
             )
-            .on_disabled_hover_text("Type a path to look for.")
+            .on_disabled_hover_text("Enter a path to find.")
             .clicked()
         {
             sweep.find(session, assets);
@@ -4479,10 +5084,10 @@ fn sweep(
                 egui::Button::new("Replace").min_size(egui::vec2(half, 24.0)),
             )
             .on_hover_text(
-                "Swap it on every tile of this map, as one entry on the history. \
-                 Each changed tile is written into the project folder.",
+                "Replace the path on every tile of this map, as one undo entry. \
+                 Each changed tile is written to the project folder.",
             )
-            .on_disabled_hover_text("Type both paths.")
+            .on_disabled_hover_text("Enter both paths.")
             .clicked()
         {
             sweep.replace(session, assets);
@@ -4508,11 +5113,11 @@ fn sweep(
             ui,
             match report.tiles {
                 0 => format!(
-                    "{} — no tile of this map names it, {} scanned.",
+                    "{} — not found in any tile of this map, {} scanned.",
                     report.what, report.scanned
                 ),
                 tiles => format!(
-                    "{} — {tiles} tile(s), {} name(s), {} scanned.",
+                    "{} — {tiles} tile(s), {} occurrence(s), {} scanned.",
                     report.what, report.names, report.scanned
                 ),
             },
@@ -4522,8 +5127,8 @@ fn sweep(
     ui.add_space(6.0);
     theme::note(
         ui,
-        "A replace does not merge a duplicate: renaming A to B on a tile that \
-         already names B leaves two entries reading B. Merging would renumber \
-         the list and every record indexing it.",
+        "Replace does not merge duplicates: replacing A with B on a tile that \
+         already lists B leaves two B entries. Merging would renumber the list \
+         and every record that indexes it.",
     );
 }

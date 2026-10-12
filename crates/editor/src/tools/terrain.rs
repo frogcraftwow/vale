@@ -26,9 +26,13 @@
 //!                or only filling, or only cutting; level, or a plane tilted
 //!                toward a compass bearing through where the stroke began
 //! select         the left button chooses vertices in place of sculpting;
-//!                the panel then moves, levels, tilts or smooths them, and
-//!                can keep strokes out of them or inside them
-//!                ([`Terrain::vertices`], [`Terrain::mask`])
+//!                the panel then moves, levels, tilts or smooths them, or
+//!                keeps strokes inside them ([`Terrain::vertices`],
+//!                [`Terrain::only_inside`])
+//! lock           the selection, or a tile's four sides, is added to the
+//!                tile's locked vertices, which no height operation moves.
+//!                Stored in the project; see `EditSession::locked` and
+//!                `EditSession::hold_locked`
 //! tilt           a tilted flatten, and a selection with a tilt set, draw
 //!                the plane's slope: a level line, the plane's line and an
 //!                arrow uphill ([`draw_tilt`])
@@ -166,11 +170,15 @@ pub struct Terrain {
     /// [`Self::vertices`].
     pub selecting: bool,
     /// The selected vertices, per open tile. Chosen by painting over them
-    /// while [`Self::selecting`] is on, then changed from the panel, or used
-    /// to mask the brush by [`Self::mask`]. See `vale_edit::ops::vertices`.
+    /// while [`Self::selecting`] is on, then changed from the panel, used to
+    /// keep strokes inside them by [`Self::only_inside`], or added to the
+    /// tile's locks. See `vale_edit::ops::vertices`.
     pub vertices: bevy::platform::collections::HashMap<(u32, u32), Selected>,
-    /// How a brush stroke treats the selection: `None` ignores it.
-    pub mask: Option<Mask>,
+    /// Whether a brush stroke moves only the selected vertices.
+    pub only_inside: bool,
+    /// How many locked vertex entries the open tiles hold, for the panel.
+    /// Written by [`vertex_asks`] each frame the tool is chosen.
+    pub locked: usize,
     /// What the panel asks to be done with the selection, taken by
     /// [`vertex_asks`]. The panel holds no session.
     pub ask: Option<VertexAsk>,
@@ -216,6 +224,15 @@ pub enum VertexAsk {
     Smooth,
     /// Select nothing.
     Clear,
+    /// Add the selection to its tiles' locked vertices.
+    Lock,
+    /// Take the selection out of its tiles' locked vertices.
+    Unlock,
+    /// Lock the vertices on all four sides of each tile that holds part of
+    /// the selection.
+    LockSides,
+    /// Unlock every vertex of every open tile.
+    UnlockAll,
 }
 
 /// How far one Smooth moves a selected vertex toward its neighbours' mean.
@@ -232,7 +249,8 @@ impl Default for Terrain {
             tilt_toward: 0.0,
             selecting: false,
             vertices: Default::default(),
-            mask: None,
+            only_inside: false,
+            locked: 0,
             ask: None,
             selected: 0,
             selected_mean: 0.0,
@@ -376,8 +394,8 @@ fn stroke(
         let carried = carry(session, std::mem::take(&mut held.standing));
         if carried > 0 {
             session.status = match carried {
-                1 => "1 object followed the ground".to_string(),
-                n => format!("{n} objects followed the ground"),
+                1 => "1 doodad/WMO placement moved with the ground".to_string(),
+                n => format!("{n} doodad/WMO placements moved with the ground"),
             };
         }
         session.history.end();
@@ -498,14 +516,16 @@ fn stroke(
             held.standing
                 .insert(coord, vale_edit::ops::follow::standing(tile));
         }
-        // The selection masks the stroke. A stroke kept inside it does
-        // nothing on a tile with none of it.
-        let mask = match (terrain.mask, terrain.vertices.get(&coord)) {
-            (Some(Mask::Confine), None) => continue,
-            (Some(mask), Some(set)) => Some((set, mask)),
-            _ => None,
+        // A stroke kept inside the selection does nothing on a tile with
+        // none of it. Locked vertices are put back afterwards, by
+        // `hold_locked`, as they are for every height operation.
+        let mask = match (terrain.only_inside, terrain.vertices.get(&coord)) {
+            (true, None) => continue,
+            (true, Some(set)) => Some((set, Mask::Confine)),
+            (false, _) => None,
         };
-        let edits = brush.stroke_masked(tile, [at.x, at.y], seconds, level, mask);
+        let mut edits = brush.stroke_masked(tile, [at.x, at.y], seconds, level, mask);
+        session.hold_locked(coord, &mut edits);
         if edits.is_empty() {
             continue;
         }
@@ -618,6 +638,9 @@ fn vertex_asks(
     if let Some(ask) = asked {
         match ask {
             VertexAsk::Clear => terrain.vertices.clear(),
+            VertexAsk::Lock | VertexAsk::Unlock | VertexAsk::LockSides | VertexAsk::UnlockAll => {
+                session.status = change_locks(session, &terrain, ask);
+            }
             _ if count == 0 => {}
             _ => {
                 match ask {
@@ -691,7 +714,8 @@ fn vertex_asks(
                     if terrain.objects_follow {
                         standing.push((coord, vale_edit::ops::follow::standing(tile)));
                     }
-                    let edits = plan.write(tile);
+                    let mut edits = plan.write(tile);
+                    session.hold_locked(coord, &mut edits);
                     if edits.is_empty() {
                         continue;
                     }
@@ -730,6 +754,14 @@ fn vertex_asks(
         terrain.tilt_applied = [0.0; 2];
         terrain.tilt_pivot = None;
     }
+    // The locked entries across the open tiles. Reading a tile's locks the
+    // first time is a file read; after that it is a count over the chunks
+    // that have any.
+    let open: Vec<(u32, u32)> = session.tiles.keys().copied().collect();
+    let locked: usize = open.into_iter().map(|coord| session.locked(coord).count()).sum();
+    if terrain.locked != locked {
+        terrain.locked = locked;
+    }
     if terrain.selected != count || terrain.selected_mean != centre[2] {
         terrain.selected = count;
         terrain.selected_mean = centre[2];
@@ -741,6 +773,44 @@ fn vertex_asks(
         for coord in std::mem::take(&mut *unpublished) {
             session.publish(coord);
         }
+    }
+}
+
+/// Carry out one of the four lock requests, and say what it did for the
+/// status line. Locks are written to the project at once and are not on the
+/// undo history; see `EditSession::set_locked`.
+fn change_locks(session: &mut EditSession, terrain: &Terrain, ask: VertexAsk) -> String {
+    let mut changed = 0usize;
+    if ask == VertexAsk::UnlockAll {
+        let open: Vec<(u32, u32)> = session.tiles.keys().copied().collect();
+        for coord in open {
+            let had = session.locked(coord).count();
+            if had > 0 {
+                changed += had;
+                session.set_locked(coord, Selected::default());
+            }
+        }
+        return format!("unlocked {changed} vertex entries on the open tiles");
+    }
+    for (&coord, set) in &terrain.vertices {
+        let Some(tile) = session.tiles.get(&coord) else {
+            continue;
+        };
+        let sides = (ask == VertexAsk::LockSides).then(|| Selected::tile_sides(tile));
+        let mut locks = session.locked(coord).clone();
+        changed += match (ask, &sides) {
+            (VertexAsk::Unlock, _) => locks.take(set),
+            (_, Some(sides)) => locks.add(sides),
+            _ => locks.add(set),
+        };
+        session.set_locked(coord, locks);
+    }
+    match ask {
+        VertexAsk::Unlock => format!("unlocked {changed} selected vertex entries"),
+        VertexAsk::LockSides => {
+            format!("locked {changed} vertex entries on the sides of the selected tiles")
+        }
+        _ => format!("locked {changed} selected vertex entries"),
     }
 }
 
@@ -811,34 +881,71 @@ fn vertices_on_the_command_line(
     }
 }
 
-/// Mark every selected vertex near the pointer with a short upright line, in
-/// front of the world, so the selection is seen through the ground's own
-/// folds.
+/// Mark every selected vertex near the pointer with a low dome on the ground,
+/// and every locked one with the same dome in red. A mark behind a fold of the
+/// ground is drawn faint, so the selection is seen through the folds.
+///
+/// A dome rather than the post a selected vertex had first: a selection of
+/// hundreds read as a field of sticks, and a dome reads as the patch of ground
+/// being chosen. WoWEdit's vertex colour picker marks the vertices under its
+/// brush the same way.
+///
+/// The domes are a fixed size rather than a few pixels: there can be
+/// [`VERTEX_MARKS`] of them, and a fixed size leaves their poses unchanged
+/// while the camera moves.
 fn draw_vertices(
-    mut gizmos: Gizmos<super::gizmo::EditorHandles>,
+    mut marks: ResMut<crate::marks::Marks>,
     session: Option<Res<EditSession>>,
     tool: Res<Tool>,
     state: Res<crate::playtest::Playtest>,
     terrain: Res<Terrain>,
     focus: Res<vale_client::render::focus::WorldFocus>,
 ) {
-    if !state.editing() || *tool != Tool::Terrain || terrain.vertices.is_empty() {
+    if !state.editing() || *tool != Tool::Terrain {
+        return;
+    }
+    if terrain.vertices.is_empty() && terrain.locked == 0 {
         return;
     }
     let Some(session) = session else { return };
-    // Yellow while the selection is only a selection, red while strokes are
-    // kept out of it and green while they are kept inside it.
-    let colour = match terrain.mask {
-        None => Color::srgb(1.0, 0.9, 0.35),
-        Some(Mask::Protect) => Color::srgb(1.0, 0.45, 0.4),
-        Some(Mask::Confine) => Color::srgb(0.45, 1.0, 0.5),
+    // Locked vertices first. A vertex both locked and selected is drawn red
+    // alone: two domes in one place would fight over the depth and flicker,
+    // and the lock is what decides whether a stroke moves it.
+    let world = |point: Vec3| vale_client::render::axes::to_bevy(point.to_array());
+    let look = crate::marks::Look::Ghosted;
+    let mut drawn = 0;
+    let mut red = std::collections::HashSet::new();
+    if terrain.locked > 0 {
+        for (coord, tile) in &session.tiles {
+            let Some(locks) = session.locks_if_read(*coord) else {
+                continue;
+            };
+            for position in locks.positions(tile) {
+                let at = Vec3::from(position);
+                if at.distance(focus.position) > VERTEX_MARK_RANGE {
+                    continue;
+                }
+                if drawn >= VERTEX_MARKS {
+                    break;
+                }
+                drawn += 1;
+                red.insert(at.to_array().map(f32::to_bits));
+                marks.cap(world(at), VERTEX_CAP, VERTEX_CAP_HEIGHT, LOCK_COLOUR, look);
+            }
+        }
+    }
+    // Yellow while the selection is only a selection, green while strokes
+    // are kept inside it.
+    let colour = match terrain.only_inside {
+        false => Color::srgb(1.0, 0.9, 0.35),
+        true => Color::srgb(0.45, 1.0, 0.5),
     };
     // While selecting with a tilt set, the plane a Tilt would put the
     // selection on, through its centre.
     if terrain.selecting && terrain.vertex_tilt[0] > 0.0 && terrain.selected > 0 {
         let [x, y] = terrain.tilt_pivot.unwrap_or(terrain.selected_centre);
         draw_tilt(
-            &mut gizmos,
+            &mut marks,
             Vec3::new(x, y, terrain.selected_mean),
             terrain.brush.radius,
             terrain.vertex_tilt[0],
@@ -846,7 +953,6 @@ fn draw_vertices(
             TILT_COLOUR,
         );
     }
-    let mut drawn = 0;
     for (coord, set) in &terrain.vertices {
         let Some(tile) = session.tiles.get(coord) else {
             continue;
@@ -859,15 +965,23 @@ fn draw_vertices(
             if drawn >= VERTEX_MARKS {
                 return;
             }
+            if red.contains(&at.to_array().map(f32::to_bits)) {
+                continue;
+            }
             drawn += 1;
-            gizmos.line(
-                vale_client::render::axes::to_bevy(position),
-                vale_client::render::axes::to_bevy((at + Vec3::Z * 1.2).to_array()),
-                colour,
-            );
+            marks.cap(world(at), VERTEX_CAP, VERTEX_CAP_HEIGHT, colour, look);
         }
     }
 }
+
+/// A selected vertex's dome, in yards: its radius and its height. Neighbouring
+/// vertices are about 2.9 yards apart, so the domes of a selection do not
+/// touch, and low enough that a slope shows through between them.
+const VERTEX_CAP: f32 = 0.7;
+const VERTEX_CAP_HEIGHT: f32 = 0.3;
+
+/// The colour of a locked vertex's mark.
+const LOCK_COLOUR: Color = Color::srgb(1.0, 0.45, 0.4);
 
 /// The colour of [`draw_tilt`]'s lines.
 const TILT_COLOUR: Color = Color::srgb(0.35, 0.95, 1.0);
@@ -878,9 +992,10 @@ const TILT_COLOUR: Color = Color::srgb(0.35, 0.95, 1.0);
 /// ends, and an arrowhead on the plane's uphill end. `at` is in world
 /// coordinates, its height on the plane.
 ///
-/// Drawn in front of the ground, since half the plane is usually under it.
+/// Half the plane is usually under the ground, so the hidden part is drawn
+/// faint rather than not at all.
 fn draw_tilt(
-    gizmos: &mut Gizmos<super::gizmo::EditorHandles>,
+    marks: &mut crate::marks::Marks,
     at: Vec3,
     reach: f32,
     angle: f32,
@@ -896,20 +1011,17 @@ fn draw_tilt(
     let dim = colour.with_alpha(0.45);
     let (level_low, level_high) = (at - along * reach, at + along * reach);
     let (low, high) = (at - up * reach, at + up * reach);
-    gizmos.line(world(level_low), world(level_high), dim);
-    gizmos.line(world(level_high), world(high), dim);
-    gizmos.line(world(low), world(high), colour);
-    // The arrowhead lies across the plane, so it reads from above.
-    let side = Vec3::new(-along.y, along.x, 0.0);
-    let back = up.normalize() * (reach * 0.15);
-    for wing in [1.0, -1.0] {
-        gizmos.line(world(high), world(high - back + side * wing * reach * 0.08), colour);
-    }
+    let look = crate::marks::Look::Ghosted;
+    marks.line(world(level_low), world(level_high), dim, look);
+    marks.line(world(level_high), world(high), dim, look);
+    // The plane's line with a head on its uphill end.
+    let thickness = marks.line_radius(world(at)) * 1.3;
+    marks.arrow(world(low), world(high), thickness, colour, look);
 }
 
 /// How far from the camera's target a selected vertex is still marked, in
-/// yards, and the most marks drawn in a frame. A mark is a gizmo line rebuilt
-/// every frame.
+/// yards, and the most marks drawn in a frame. A mark is a mesh posed every
+/// frame.
 const VERTEX_MARK_RANGE: f32 = 400.0;
 const VERTEX_MARKS: usize = 20_000;
 
@@ -924,7 +1036,12 @@ pub(crate) fn carry(
     standing: impl IntoIterator<Item = ((u32, u32), vale_edit::ops::follow::Standing)>,
 ) -> usize {
     let mut carried = 0;
-    for (coord, was) in standing {
+    for (coord, mut was) in standing {
+        // A locked placement is left where it is: `follow` moves only the
+        // placements `was` names.
+        let locks = session.placement_locks();
+        was.doodads.retain(|(id, _)| !locks.doodads.contains(id));
+        was.buildings.retain(|(id, _)| !locks.wmos.contains(id));
         let key = session.key(coord);
         let Some(tile) = session.tiles.get_mut(&coord) else {
             continue;
@@ -1246,17 +1363,17 @@ fn remesh(
     // together is replaced together, which for the one thing that makes two
     // tiles stale at once is the whole point.
     mut batch: Local<u64>,
-    // **The revision each in-flight replacement was started at** — see the loop
-    // below, and `crate::session::EditSession::revision`.
+    // **The change count each in-flight replacement was started at** — see the
+    // loop below, and `crate::session::EditSession::changes`.
     mut started: Local<bevy::platform::collections::HashMap<(u32, u32), u64>>,
 ) {
     let Some(session) = session.as_mut() else {
         return;
     };
 
-    // **A replacement reads the file once, when it is started.** Anything
-    // published between then and the frame it lands is a change that read cannot
-    // have seen, and nothing downstream corrects it: the live sets — the
+    // **A replacement reads the file once, when it is started.** Any change
+    // made between then and the frame it lands is one that read cannot have
+    // seen, and nothing downstream corrects it: the live sets — the
     // ground's vertices, a placement's transform, a chunk's blend map — were
     // drained against the *outgoing* copy, which is despawned the moment the
     // incoming one appears. So the tile on screen goes back to whatever the
@@ -1277,8 +1394,11 @@ fn remesh(
             .any(|(_, tile, going)| tile.coord == *coord && going.is_some())
     });
     let mut behind: Vec<(u32, u32)> = Vec::new();
+    // Compared against every in-memory change and not only against publishes:
+    // a vertex drag changes the tile on every frame and publishes it only when
+    // the button comes up. See `crate::session::EditSession::changes`.
     for (coord, had) in started.iter() {
-        if *had != session.revision(*coord) {
+        if *had != session.changes(*coord) {
             behind.push(*coord);
         }
     }
@@ -1322,9 +1442,18 @@ fn remesh(
                 commands.entity(entity).insert(Replacing(*batch));
             }
         }
+        // **The read sees the tile as it is now.** A read is of the overlay,
+        // which is what was last published, and a tile can be ahead of that:
+        // a vertex drag publishes when the button comes up, while carrying the
+        // placements on the moved ground can mark the tile stale on any frame
+        // of it. Read from the older bytes, the replacement drew the ground
+        // part as it was before the drag.
+        if session.is_unpublished(coord) {
+            session.publish(coord);
+        }
         // What the read about to start will see. Taken here rather than when it
         // lands, so the error is on the side of one read too many.
-        started.insert(coord, session.revision(coord));
+        started.insert(coord, session.changes(coord));
         // **Without the despawn this time**, which is the half `LoadedTiles`'
         // own comment warns about: forgetting a tile without despawning it
         // draws the tile twice. [`swap`] is what pairs with it, one frame later
@@ -1427,8 +1556,7 @@ fn swap(
 /// two disagree by the whole of what has been painted, and the ring is the only
 /// thing on screen that is up to date.
 fn draw_brush(
-    mut gizmos: Gizmos,
-    mut handles: Gizmos<super::gizmo::EditorHandles>,
+    mut marks: ResMut<crate::marks::Marks>,
     session: Option<Res<EditSession>>,
     tool: Res<Tool>,
     terrain: Res<Terrain>,
@@ -1458,7 +1586,7 @@ fn draw_brush(
     // which on a slope is the difference between a circle and an ellipse in the
     // wrong place.
     rings(
-        &mut gizmos,
+        &mut marks,
         &session,
         at,
         terrain.brush.radius,
@@ -1481,7 +1609,7 @@ fn draw_brush(
                 (false, false) => terrain.flatten_height,
             };
             draw_tilt(
-                &mut handles,
+                &mut marks,
                 Vec3::new(at.x, at.y, height),
                 terrain.brush.radius,
                 terrain.tilt_angle,
@@ -1508,7 +1636,7 @@ fn draw_brush(
 /// is the report. Two copies of a rule is how the third comes to be missing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rings(
-    gizmos: &mut Gizmos,
+    marks: &mut crate::marks::Marks,
     session: &EditSession,
     at: Vec3,
     radius: f32,
@@ -1519,14 +1647,20 @@ pub(crate) fn rings(
     let inner = (core > 0.0).then(|| radius * core);
     for (radius, shade) in [Some(radius), inner]
         .into_iter()
-        .zip([1.0, 0.5])
+        .zip([1.0, 0.6])
         .filter_map(|(radius, shade)| Some((radius?, shade)))
     {
-        ring(gizmos, session, at, radius, shape, colour.with_alpha(shade));
+        ring(marks, session, at, radius, shape, colour.with_alpha(shade));
     }
 }
 
-/// One ring of 48 segments, each vertex dropped onto the edited ground.
+/// One dashed ring of 64 segments, each vertex dropped onto the edited ground.
+///
+/// Three segments of each four are drawn, so the ring is sixteen dashes and
+/// reads as a brush rather than as a line on the map. A dash is a tube a few
+/// pixels thick ([`crate::marks::Marks::line`]), so a hill between the camera
+/// and the ring hides it; the hidden part is drawn faint
+/// ([`crate::marks::Look::Ghosted`]).
 ///
 /// Shared with the texture brush, which wants the same ring for the same reason
 /// and must not grow a second copy of it: two brushes that disagreed about where
@@ -1541,7 +1675,7 @@ pub(crate) fn rings(
 /// ground, on ground that is not torn. A gap in the ring says what is true,
 /// which is that there is nothing there to draw on.
 pub(crate) fn ring(
-    gizmos: &mut Gizmos,
+    marks: &mut crate::marks::Marks,
     session: &EditSession,
     at: Vec3,
     radius: f32,
@@ -1569,9 +1703,11 @@ pub(crate) fn ring(
         Some(vale_client::render::axes::to_bevy([x, y, z + LIFT]))
     };
     let points: Vec<Option<Vec3>> = rim.iter().map(point).collect();
-    for i in 0..points.len() {
+    for i in (0..points.len()).filter(|i| i % 4 != 3) {
         if let (Some(from), Some(to)) = (points[i], points[(i + 1) % points.len()]) {
-            gizmos.line(from, to, colour);
+            // Resting on the ground rather than half in it. See
+            // `crate::marks::Marks::ground_line`.
+            marks.wide_ground_line(from, to, 1.5, colour, crate::marks::Look::Ghosted);
         }
     }
 }

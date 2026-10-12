@@ -186,15 +186,21 @@ const TERRAIN_OVER_FLOOR: f32 = 2.0;
 /// `z += 1.0f` and keeps a character standing on a floor from reading the
 /// floor as above them.
 pub fn outdoors_at(building: Option<(f32, u32)>, terrain: Option<f32>, probe_z: f32) -> bool {
-    let Some((floor, flags)) = building else {
-        return true;
-    };
+    building_under(building, terrain, probe_z).is_none_or(|flags| flags & group_flags::OUTDOOR != 0)
+}
+
+/// **The `MOGP` flags of the building group a character counts as standing
+/// in**, or `None` where the building does not count: the first two clauses
+/// of [`outdoors_at`], before the flag is read. The minimap asks this to
+/// decide whether it shows the building's own pictures.
+pub fn building_under(building: Option<(f32, u32)>, terrain: Option<f32>, probe_z: f32) -> Option<u32> {
+    let (floor, flags) = building?;
     if let Some(ground) = terrain {
         if probe_z + TERRAIN_OVER_FLOOR > ground && ground > floor {
-            return true;
+            return None;
         }
     }
-    flags & group_flags::OUTDOOR != 0
+    Some(flags)
 }
 
 /// One `MOMT` material.
@@ -1877,6 +1883,100 @@ pub fn group_path(root_path: &str, index: u32) -> String {
     }
 }
 
+/// One `MOPR` record: a group's reference to a portal and to the group on the
+/// portal's other side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WmoPortalRef {
+    /// Index into [`WmoPortals::portals`].
+    pub portal: u16,
+    /// The group on the other side; `0xFFFF` names none.
+    pub group: u16,
+    /// Which side of the portal's plane the owning group is on.
+    pub side: i16,
+}
+
+/// A root's portal graph, WMO-local: `MOPV` vertices, `MOPT` portals and `MOPR`
+/// references. A group's own references are the slice
+/// [`WmoGroupHeader::portal_start`]..+[`WmoGroupHeader::portal_count`] of
+/// [`Self::refs`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WmoPortals {
+    pub vertices: Vec<[f32; 3]>,
+    /// `MOPT`, 20 bytes each: the first vertex and the vertex count. The plane
+    /// that follows them is not read.
+    pub portals: Vec<(u16, u16)>,
+    /// `MOPR`, 8 bytes each.
+    pub refs: Vec<WmoPortalRef>,
+}
+
+impl WmoPortals {
+    /// Read the three chunks out of a root file. A root without them (most
+    /// small buildings have no portals) gives an empty graph.
+    pub fn parse(root: &[u8]) -> WmoPortals {
+        let mut out = WmoPortals::default();
+        let u16_at = |b: &[u8], at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
+        for c in ChunkReader::new(root) {
+            match &c.magic {
+                b"MOPV" => out.vertices = c.data.chunks_exact(12).map(|v| read_vec3(v, 0)).collect(),
+                b"MOPT" => {
+                    out.portals = c.data.chunks_exact(20).map(|p| (u16_at(p, 0), u16_at(p, 2))).collect();
+                }
+                b"MOPR" => {
+                    out.refs = c
+                        .data
+                        .chunks_exact(8)
+                        .map(|r| WmoPortalRef {
+                            portal: u16_at(r, 0),
+                            group: u16_at(r, 2),
+                            side: u16_at(r, 4) as i16,
+                        })
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// One portal's polygon, or `None` for an index or a vertex range the file
+    /// does not hold.
+    pub fn polygon(&self, portal: u16) -> Option<&[[f32; 3]]> {
+        let &(start, count) = self.portals.get(usize::from(portal))?;
+        let start = usize::from(start);
+        self.vertices.get(start..start + usize::from(count))
+    }
+}
+
+/// The part of a group file's `MOGP` header that does not need the geometry:
+/// the flags, the box and the group's slice of the root's portal references.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WmoGroupHeader {
+    pub flags: u32,
+    /// WMO-local, `[min, max]`.
+    pub bounds: [[f32; 3]; 2],
+    /// `MOGP` 0x24: the first of this group's `MOPR` records.
+    pub portal_start: u16,
+    /// `MOGP` 0x26: how many there are.
+    pub portal_count: u16,
+}
+
+impl WmoGroupHeader {
+    /// `None` for a file with no `MOGP` or a short header.
+    pub fn parse(buf: &[u8]) -> Option<WmoGroupHeader> {
+        let mogp = ChunkReader::new(buf).find(|c: &Chunk| c.is(b"MOGP"))?;
+        let data = mogp.data;
+        if data.len() < MOGP_HEADER_SIZE {
+            return None;
+        }
+        Some(WmoGroupHeader {
+            flags: chunk::u32_at(data, 0x08),
+            bounds: [read_vec3(data, 0x0C), read_vec3(data, 0x18)],
+            portal_start: u16::from_le_bytes([data[0x24], data[0x25]]),
+            portal_count: u16::from_le_bytes([data[0x26], data[0x27]]),
+        })
+    }
+}
+
 /// The model-to-WMO-local matrix for one `MODD` spawn, column-major.
 ///
 /// `translate(position) * rotate(quaternion) * scale`, with the quaternion used
@@ -2041,7 +2141,8 @@ fn parse_group_info(data: &[u8]) -> Vec<WmoGroupInfo> {
 /// ```text
 /// 0x00 u8      kind          0 omni, 1 spot, 2 direct, 3 ambient
 /// 0x01 u8      use_atten
-/// 0x02 u8[2]   pad
+/// 0x02 u8      diffuse       the light has a diffuse term
+/// 0x03 u8      ambient       the light has an ambient term
 /// 0x04 BGRA    colour
 /// 0x08 f32[3]  position, in the building's own space
 /// 0x14 f32     intensity
@@ -2068,6 +2169,12 @@ pub struct WmoLight {
     pub kind: u8,
     /// Whether the two distances below are read at all.
     pub use_atten: bool,
+    /// Whether the light lights a model's surfaces facing it: its colour
+    /// times intensity, times the cosine. Set on all ten of the inn's.
+    pub diffuse: bool,
+    /// Whether it also adds its colour times intensity to every surface of
+    /// the model, facing it or not. Also set on all ten of the inn's.
+    pub ambient: bool,
     /// Its colour, 0..1, **sRGB as the file states it** — the space every other
     /// band in this project is summed in. `MOLT` stores BGRA.
     pub colour: [f32; 3],
@@ -2086,6 +2193,27 @@ impl WmoLight {
     pub fn is_point(&self) -> bool {
         self.kind == 0 && self.use_atten && self.atten_end > self.atten_start
     }
+
+    /// Whether the light lights the models standing near it: an omni light,
+    /// whatever its falloff says. See [`Self::model_reach`].
+    pub fn lights_models(&self) -> bool {
+        self.kind == 0
+    }
+
+    /// How far from the light a model may stand and still be lit by it, in
+    /// the building's yards: the attenuation end, moved out by a tenth of a
+    /// yard when it is within a thousandth of the start.
+    ///
+    /// It is a reach and not a falloff. A model inside it takes the light at
+    /// the fixed point-light curve `1 / (0.7d + 0.03d²)`, which has no radius
+    /// in it, so the light does not fade to nothing at this distance.
+    pub fn model_reach(&self) -> f32 {
+        if (self.atten_end - self.atten_start).abs() < 0.001 {
+            self.atten_end + 0.1
+        } else {
+            self.atten_end
+        }
+    }
 }
 
 /// `MOLT`: one 48-byte record per light. See [`WmoLight`] for the layout and
@@ -2095,6 +2223,8 @@ fn parse_lights(data: &[u8]) -> Vec<WmoLight> {
         .map(|r| WmoLight {
             kind: r[0],
             use_atten: r[1] != 0,
+            diffuse: r[2] != 0,
+            ambient: r[3] != 0,
             // BGRA on disk, and the alpha is not an opacity — no light in the
             // measured set has anything but 255 in it.
             colour: [
@@ -2126,6 +2256,8 @@ mod light_tests {
         let mut r = vec![0u8; 0x30];
         r[0] = 0; // omni
         r[1] = 1; // attenuated
+        r[2] = 1; // diffuse
+        r[3] = 1; // ambient
         r[4..8].copy_from_slice(&[160, 255, 255, 255]); // BGRA
         r[0x08..0x14].copy_from_slice(&[
             0x00, 0x00, 0x12, 0xC1, // -9.125
@@ -2142,6 +2274,7 @@ mod light_tests {
         let l = lights[0];
         assert_eq!(l.kind, 0);
         assert!(l.use_atten);
+        assert!(l.diffuse && l.ambient);
         // BGRA on disk, so the warm channel is the *last* byte of the four.
         assert_eq!(l.colour, [1.0, 1.0, 160.0 / 255.0]);
         assert_eq!(l.intensity, 1.0);
@@ -2160,6 +2293,8 @@ mod light_tests {
         let lamp = WmoLight {
             kind: 0,
             use_atten: true,
+            diffuse: true,
+            ambient: true,
             colour: [1.0, 1.0, 1.0],
             position: [0.0; 3],
             intensity: 1.0,
@@ -2172,6 +2307,28 @@ mod light_tests {
         assert!(!WmoLight { use_atten: false, ..lamp }.is_point());
         // A falloff that ends where it starts lights nothing.
         assert!(!WmoLight { atten_end: 5.0, ..lamp }.is_point());
+    }
+
+    /// The reach a model is lit within is the falloff's end, nudged out when
+    /// the falloff has no width, and only an omni light has one.
+    #[test]
+    fn a_model_is_lit_within_the_falloffs_end() {
+        let lamp = WmoLight {
+            kind: 0,
+            use_atten: true,
+            diffuse: true,
+            ambient: true,
+            colour: [1.0, 1.0, 1.0],
+            position: [0.0; 3],
+            intensity: 1.0,
+            atten_start: 5.0,
+            atten_end: 6.972,
+        };
+        assert_eq!(lamp.model_reach(), 6.972);
+        assert!((WmoLight { atten_end: 5.0, ..lamp }.model_reach() - 5.1).abs() < 1e-6);
+        assert!(lamp.lights_models());
+        assert!(WmoLight { use_atten: false, ..lamp }.lights_models());
+        assert!(!WmoLight { kind: 1, ..lamp }.lights_models());
     }
 
     /// A truncated tail yields the whole records and drops the fragment, which

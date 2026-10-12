@@ -6,9 +6,9 @@
 //!
 //! Several subjects store their edits as rows in vmangos' database rather than
 //! as bytes in a file: the client tables (spells, flight nodes and skill line
-//! abilities), creatures,
-//! objects, items, quests, loot, vendors and trainers, and behaviour. Each
-//! subject used to keep these operations in its own panel. The result was three names for one operation
+//! abilities), creatures, objects, items, quests, loot, vendors and trainers,
+//! and behaviour. Each subject used to keep these operations in its own panel.
+//! The result was three names for one operation
 //! (*Apply to the server*, *Apply*, and a checkbox in a third window for
 //! spells), three names for its inverse (*Put the rows back*, *Revert*, *Put
 //! the server back*), and one panel that applied on every save while the other
@@ -47,7 +47,7 @@
 //! the server.
 //!
 //! Apply and Put back on a row subject also act on the blocks below it. The
-//! seven row subjects stand in the database in the panel's order, and an item
+//! twelve row subjects stand in the database in the panel's order, and an item
 //! renumber moves loot rows and quest columns, so every applied subject below
 //! the one pressed is put back first and applied again after. See
 //! `crate::server::stack`. The client-table block is outside that order.
@@ -95,8 +95,8 @@ use bevy_egui::egui;
 
 use super::theme;
 use crate::server::{
-    behaviour, creatures, dbcs, gameobjects, items, loot, queue::ServerQueue, quests, rows,
-    services, settings::ServerSettings, stack,
+    behaviour, creatures, dbcs, gameobjects, items, loot, places, queue::ServerQueue, quests,
+    rows, services, settings::ServerSettings, stack,
 };
 use crate::session::EditSession;
 use vale_client::assets::GameAssets;
@@ -114,8 +114,8 @@ use vale_client::assets::GameAssets;
 /// Each answer is therefore recomputed at most every [`REFRESH`] seconds, and
 /// [`Self::forget`] drops them all as soon as anything is applied, put back or
 /// discarded. Those presses are the only events after which a stale number
-/// could be shown for longer than [`REFRESH`] and be wrong in a way that
-/// matters.
+/// could be shown for longer than [`REFRESH`] and be wrong about the block's
+/// line or which of its buttons are enabled.
 #[derive(Resource, Default)]
 pub struct Standings {
     /// `(taken at, what it said)` per subject, in [`Half::ALL`]'s order.
@@ -134,7 +134,7 @@ pub struct Standings {
     files: Option<(f64, Result<dbcs::Standing, String>)>,
 }
 
-/// How long one of those answers is reused for.
+/// How long a held [`Standing`] is reused, in seconds.
 const REFRESH: f64 = 0.5;
 
 /// How long the tile count is reused for. Computing it reads every tile in
@@ -261,7 +261,7 @@ pub enum Half {
     Items,
     Quests,
     /// The nine loot tables, which have no rail entry of their own: a loot
-    /// set is reached from the creature, the object or the item it hangs off.
+    /// set is reached from the creature, the object or the item it belongs to.
     Loot,
     /// What creatures sell and teach, reached from a selected creature's
     /// Vendor and Trainer windows.
@@ -269,13 +269,23 @@ pub enum Half {
     /// A creature's events, scripts and spell lists, reached from a selected
     /// creature's Events and Spells windows.
     Behaviour,
+    /// The `conditions` table, from the condition window.
+    Conditions,
+    /// Gossip menus, options and texts, from the gossip window.
+    Gossip,
+    /// A new map's `map_template` row, made by the map window's New map.
+    Maps,
+    /// What area triggers do, from the Triggers tool.
+    Triggers,
+    /// Which safe place serves which zone, from the Graveyards tool.
+    Graveyards,
 }
 
 /// The number of subjects. [`Standings`] holds one answer for each.
-pub const HALVES: usize = 8;
+pub const HALVES: usize = 13;
 
 impl Half {
-    pub const ALL: [Half; 8] = [
+    pub const ALL: [Half; 13] = [
         Half::Tables,
         Half::Creatures,
         Half::GameObjects,
@@ -284,6 +294,11 @@ impl Half {
         Half::Loot,
         Half::Services,
         Half::Behaviour,
+        Half::Conditions,
+        Half::Gossip,
+        Half::Maps,
+        Half::Triggers,
+        Half::Graveyards,
     ];
 
     /// The subject's name, in the rail's wording.
@@ -297,6 +312,11 @@ impl Half {
             Half::Loot => "Loot",
             Half::Services => "Vendors and trainers",
             Half::Behaviour => "Behaviour",
+            Half::Conditions => "Conditions",
+            Half::Gossip => "Gossip",
+            Half::Maps => "Maps",
+            Half::Triggers => "Area triggers",
+            Half::Graveyards => "Graveyards",
         }
     }
 
@@ -304,7 +324,7 @@ impl Half {
     /// the table names are what the database shows.
     pub fn tables(self) -> &'static str {
         match self {
-            Half::Tables => "spell_template, taxi_nodes, skill_line_ability, area_template",
+            Half::Tables => "spell_template, taxi_nodes, skill_line_ability, area_template, areatrigger_template",
             Half::Creatures => "creature_template, creature, creature_movement",
             Half::GameObjects => "gameobject_template, gameobject",
             Half::Items => "item_template",
@@ -312,6 +332,11 @@ impl Half {
             Half::Loot => "the nine *_loot_template tables",
             Half::Services => "npc_vendor, npc_vendor_template, npc_trainer, npc_trainer_template",
             Half::Behaviour => "creature_ai_events, creature_spells, broadcast_text, and the eleven *_scripts tables",
+            Half::Conditions => "conditions",
+            Half::Gossip => "npc_text, points_of_interest, gossip_menu, gossip_menu_option",
+            Half::Maps => "map_template",
+            Half::Triggers => "areatrigger_template (label, script, condition, cooldown), areatrigger_teleport, areatrigger_tavern, areatrigger_involvedrelation, areatrigger_bg_entrance",
+            Half::Graveyards => "game_graveyard_zone, world_safe_locs_facing",
         }
     }
 
@@ -326,6 +351,7 @@ impl Half {
             Half::Loot => loot::SQL_VPATH,
             Half::Services => services::SQL_VPATH,
             Half::Behaviour => behaviour::SQL_VPATH,
+            Half::Conditions | Half::Gossip | Half::Maps | Half::Triggers | Half::Graveyards => self.group().map_or("", places::Group::sql_vpath),
         }
     }
 
@@ -341,6 +367,7 @@ impl Half {
             Half::Loot => loot::REVERT_VPATH,
             Half::Services => services::REVERT_VPATH,
             Half::Behaviour => behaviour::REVERT_VPATH,
+            Half::Conditions | Half::Gossip | Half::Maps | Half::Triggers | Half::Graveyards => self.group().map_or("", places::Group::revert_vpath),
         }
     }
 
@@ -355,9 +382,9 @@ impl Half {
                  need a restart: `taxi_nodes`, `skill_line_ability` and `area_template` \
                  are read at startup and have no reload. So do the DBC files Apply copies into DataDir\\5875\\dbc: \
                  TaxiPath, TaxiPathNode, SkillLine, SkillRaceClassInfo and ItemSet among \
-                 them. A spell *removed* \
-                 needs a restart too: the reload overwrites and \
-                 adds, and never drops one it has already read."
+                 them. A removed spell \
+                 also needs a restart: the reload overwrites and \
+                 adds rows, and never drops a row it has already read."
             }
             Half::Creatures => {
                 "The server has to be restarted. `.reload creature_template` does not \
@@ -373,7 +400,7 @@ impl Half {
                 "Live on `.reload item_template`, which an apply sends when it is made \
                  with the panels open over a playtest — for every copy of the item \
                  already in a bag, in the world and on the auction house, with no relog. \
-                 Applied at any other time, it is live after a restart. An item *removed* \
+                 Applied at any other time, it is live after a restart. A removed item \
                  needs a restart, and the apply sends no reload while one is in the \
                  plan: a reload would leave every copy already loaded with no \
                  prototype, which the server does not check for."
@@ -383,7 +410,7 @@ impl Half {
                  written, which an apply sends in that order when it is made with the \
                  panels open over a playtest \u{2014} removals included. Applied at any \
                  other time, it is live after a restart. The reload frees every quest the server holds, so do \
-                 not apply while an escort quest is in progress on it."
+                 not apply while an escort quest is in progress on the server."
             }
             Half::Loot => {
                 "Live on `.reload <table>` for each loot table written, which an apply sends \
@@ -410,6 +437,38 @@ impl Half {
                  their own names; the other six and broadcast_text are read at start, so a \
                  change to one of those needs a restart."
             }
+            Half::Conditions => {
+                "Live on `.reload conditions`, which an apply sends when it is made with the \
+                 panels open over a playtest. Applied at any other time, it is live after a \
+                 restart."
+            }
+            Half::Gossip => {
+                "Live on `.reload npc_text`, `.reload points_of_interest`, `.reload gossip_menu` \
+                 and `.reload gossip_menu_option`, which an apply sends when it is made with the \
+                 panels open over a playtest \u{2014} removals included. A text a menu shows is \
+                 broadcast_text, applied by Behaviour above."
+            }
+            Half::Maps => {
+                "Read on `.reload map_template`, which an apply sends when it is made with the \
+                 panels open over a playtest, but the server opens a map's grids at startup, \
+                 so a new map needs a restart before a character can enter it. The map's \
+                 Map.dbc row is a client table, applied by Client tables above, and its \
+                 terrain reaches the server through Server files on the map window."
+            }
+            Half::Triggers => {
+                "Live on `.reload areatrigger_teleport`, `.reload areatrigger_tavern` and \
+                 `.reload areatrigger_involvedrelation`, which an apply sends when it is made \
+                 with the panels open over a playtest \u{2014} removals included. Applied at any \
+                 other time, it is live after a restart. The template's columns and \
+                 areatrigger_bg_entrance have no reload and need a restart. A trigger's \
+                 volume is a client table, applied by Client tables above."
+            }
+            Half::Graveyards => {
+                "Live on `.reload game_graveyard_zone`, which an apply sends when it is made \
+                 with the panels open over a playtest \u{2014} removals included. \
+                 world_safe_locs_facing has no reload and needs a restart. A graveyard's \
+                 position is a WorldSafeLocs.dbc row, applied by Client tables above."
+            }
         }
     }
 
@@ -419,9 +478,9 @@ impl Half {
     /// last subject in the stack, which has nothing below it.
     pub fn order_note(self) -> &'static str {
         match self.subject() {
-            None | Some(stack::Subject::Behaviour) => "",
+            None | Some(stack::Subject::Graveyards) => "",
             Some(_) => {
-                " Applied subjects below this one are put back first and applied again \
+                " Applied subjects below this one are restored first and applied again \
                  after, because this one's statements can move their rows."
             }
         }
@@ -439,7 +498,17 @@ impl Half {
             Half::Loot => Some(stack::Subject::Loot),
             Half::Services => Some(stack::Subject::Services),
             Half::Behaviour => Some(stack::Subject::Behaviour),
+            Half::Conditions => Some(stack::Subject::Conditions),
+            Half::Gossip => Some(stack::Subject::Gossip),
+            Half::Maps => Some(stack::Subject::Maps),
+            Half::Triggers => Some(stack::Subject::Triggers),
+            Half::Graveyards => Some(stack::Subject::Graveyards),
         }
+    }
+
+    /// The `places` group behind the five blocks that module writes.
+    pub fn group(self) -> Option<places::Group> {
+        self.subject().and_then(stack::Subject::group)
     }
 
     /// Whether this subject's claim is a store of rows, which Discard can give
@@ -491,7 +560,8 @@ pub struct Standing {
 }
 
 impl Standing {
-    /// Whether there is anything to say about this subject at all.
+    /// Whether there is nothing to say about this subject: no change, no
+    /// applied row, no unsaved table, no refusal and no error.
     pub fn quiet(&self) -> bool {
         self.changed == 0
             && self.applied == 0
@@ -517,14 +587,14 @@ impl Standing {
             (0, 0) => "nothing changed".to_string(),
             (changed, 0) => format!("{changed} row(s) changed, none applied"),
             (0, applied) => format!(
-                "{applied} row(s) applied and undoable, and this project now changes none \
-                 of them"
+                "{applied} row(s) applied, none of them changed by this project any more; \
+                 Restore reverts them"
             ),
             (changed, applied) => {
                 let caveat = match (self.outstanding, self.current) {
                     (0, true) => " \u{2014} all applied".to_string(),
-                    (0, false) => " \u{2014} all applied, though something has been edited \
-                                   since or this is a later session"
+                    (0, false) => " \u{2014} all applied; the project may have changed since \
+                                   the last Apply"
                         .to_string(),
                     (out, _) => format!(" \u{2014} {out} not applied yet"),
                 };
@@ -664,6 +734,24 @@ pub fn standing(half: Half, session: &EditSession, assets: &GameAssets) -> Stand
                 unsaved: false,
             }
         }
+        Half::Conditions | Half::Gossip | Half::Maps | Half::Triggers | Half::Graveyards => {
+            let group = half.group().unwrap_or(places::Group::Maps);
+            let plan = places::plan(session, group);
+            let on_server = places::OnTheServer::read_with(session, &plan, group);
+            Standing {
+                changed: plan.rows.len(),
+                outstanding: plan
+                    .rows
+                    .iter()
+                    .filter(|row| !on_server.covers(row.table, &row.key))
+                    .count(),
+                applied: on_server.rows(),
+                current: on_server.current(),
+                refused: plan.refused.clone(),
+                trouble: None,
+                unsaved: false,
+            }
+        }
         Half::Services => {
             let plan = services::plan(session);
             let on_server = services::OnTheServer::read_with(session, &plan);
@@ -753,6 +841,12 @@ pub fn save(half: Half, work: &mut Work<'_>) {
             creatures::save(work.session);
             behaviour::save(work.session);
         }
+        Half::Conditions | Half::Gossip | Half::Maps | Half::Triggers | Half::Graveyards => {
+            creatures::save(work.session);
+            if let Some(group) = half.group() {
+                places::save_group(work.session, group);
+            }
+        }
     }
 }
 
@@ -768,7 +862,7 @@ pub fn apply(half: Half, work: &mut Work<'_>) -> Result<String, String> {
     let work_for = match half {
         Half::Tables => {
             // The files the server reads from DataDir\5875\dbc are copied here, on
-            // the press: a few hundred kilobytes, and nothing to wait for.
+            // the press: a few hundred kilobytes, small enough to copy on the main thread.
             let files = sync_files(work);
             let plan = rows::plan(work.session, work.assets)?;
             if plan.nothing() {
@@ -797,7 +891,7 @@ pub fn apply(half: Half, work: &mut Work<'_>) -> Result<String, String> {
             };
             Some((label, rows::apply_work(work.session, plan, work.server)?))
         }
-        // The six row subjects go through the stack, which puts back and
+        // The twelve row subjects go through the stack, which puts back and
         // applies again every applied subject after this one. See
         // `crate::server::stack`.
         _ => match half.subject() {
@@ -825,8 +919,8 @@ pub fn put_back(half: Half, work: &mut Work<'_>) -> Result<String, String> {
                 (Some(files), None) => return Ok(files),
                 (files, Some(write)) => {
                     let label = match files {
-                        Some(files) => format!("{files}; putting back client table rows"),
-                        None => "putting back client table rows".to_string(),
+                        Some(files) => format!("{files}; restoring client table rows"),
+                        None => "restoring client table rows".to_string(),
                     };
                     Some((label, write))
                 }
@@ -882,7 +976,7 @@ fn put_back_files(work: &mut Work<'_>) -> Option<String> {
             .and_then(|dir| dbcs::put_back_at(project, &vale_mangos::datadir::dbc_dir(&dir)))
         {
             Ok(done) => done.line(),
-            Err(e) => format!("server DBC files not put back: {e}"),
+            Err(e) => format!("server DBC files not restored: {e}"),
         },
     )
 }
@@ -903,7 +997,7 @@ pub fn discard(half: Half, session: &mut EditSession) -> String {
 /// Draws the whole section: the *Apply on save* switch, then one block per
 /// subject.
 pub fn project(ui: &mut egui::Ui, work: &mut Work<'_>) {
-    theme::heading(ui, "This project on the server");
+    theme::heading(ui, "Server operations");
     let have_a_database = work.server.resolve().is_some();
 
     // One switch covers every subject, as its label says. See
@@ -914,19 +1008,19 @@ pub fn project(ui: &mut egui::Ui, work: &mut Work<'_>) {
             egui::Checkbox::new(&mut work.server.apply_on_save, "Apply on save"),
         )
         .on_hover_text(
-            "Every save runs what it has just written, for every subject. A save made \
-             with the panels open over a playtest also tells the server to re-read the \
-             tables that take a reload. Off writes the SQL files and touches nothing.",
+            "Every save also runs the SQL it writes against the world database, for every \
+             subject. A save made with the panels open over a playtest also sends .reload \
+             for each table that has one. When off, a save only writes the SQL files.",
         )
-        .on_disabled_hover_text("There is no database to apply to.")
+        .on_disabled_hover_text("No world database is set.")
         .changed()
     {
         work.server.save(&work.assets.root);
     }
     theme::note(
         ui,
-        "A save always writes the statements into the project folder. This decides whether \
-         it also runs them.",
+        "A save always writes the SQL statements into the project folder. This setting \
+         decides whether the save also runs them against the database.",
     );
 
     ui.add_space(4.0);
@@ -977,8 +1071,8 @@ fn block_body(
     colour: egui::Color32,
 ) {
     let about = format!(
-        "{}\n\nA save writes the statements to {}; {} holds the ones that put every \
-         applied row back.\n\n{}",
+        "{}\n\nA save writes the statements to {}; {} holds the statements that revert \
+         every applied row.\n\n{}",
         half.tables(),
         half.file(),
         half.revert_file(),
@@ -1036,9 +1130,9 @@ fn block_body(
             };
             ui.label(egui::RichText::new(files.line()).small().color(colour))
                 .on_hover_text(format!(
-                    "The client tables vmangos reads as files: {}. Apply copies the \
-                     project's copies into DataDir\\5875\\dbc, saving the server's own under \
-                     the project's {} first; Put back restores those.",
+                    "The client tables vmangos reads as DBC files: {}. Apply copies the \
+                     project's versions into DataDir\\5875\\dbc, first saving the server's \
+                     originals under the project's {}; Restore copies the originals back.",
                     match files.carried.is_empty() {
                         true => "none in this project".to_string(),
                         false => files.carried.join(", "),
@@ -1058,8 +1152,8 @@ fn block_body(
     if standing.unsaved {
         ui.label(
             egui::RichText::new(
-                "\u{2026}and a table edited since the last save, which is in no count above. \
-                 Apply writes it into the project first.",
+                "A table was edited since the last save and is not in the counts above. \
+                 Apply saves it into the project first.",
             )
             .small()
             .color(theme::WARN),
@@ -1085,8 +1179,8 @@ fn block_body(
 }
 
 /// A block's three buttons, laid out from the right: Apply, Put back, then
-/// Discard or the note that the subject is edited as a file. A press is
-/// answered into `said`.
+/// Discard or the note that the subject is edited as a file. A press stores
+/// its result in `said`.
 #[allow(clippy::too_many_arguments)]
 fn buttons(
     ui: &mut egui::Ui,
@@ -1110,8 +1204,8 @@ fn buttons(
                 half.order_note()
             ))
             .on_disabled_hover_text(match (have_a_database, busy) {
-                (false, _) => "There is no world database to reach.",
-                (true, true) => "A server sync is in progress.",
+                (false, _) => "No world database is set.",
+                (true, true) => "A server write is running.",
                 (true, false) => "This project changes no row of these tables.",
             })
             .clicked()
@@ -1119,16 +1213,16 @@ fn buttons(
             *said = Some(apply(half, work));
         }
         if ui
-            .add_enabled(can_put_back, egui::Button::new("Put back"))
+            .add_enabled(can_put_back, egui::Button::new("Restore"))
             .on_hover_text(format!(
-                "Run {}, which returns every row this project has applied to what it held \
-                 before the project first touched it, and then forgets it.{}",
+                "Run {}, which restores every row this project has applied to its value \
+                 before the project first changed it, then discard the revert record.{}",
                 half.revert_file(),
                 half.order_note()
             ))
             .on_disabled_hover_text(match (have_a_database, busy) {
-                (false, _) => "There is no world database to talk to.",
-                (true, true) => "A server sync is in progress.",
+                (false, _) => "No world database is set.",
+                (true, true) => "A server write is running.",
                 (true, false) => "This project has applied nothing.",
             })
             .clicked()
@@ -1139,9 +1233,9 @@ fn buttons(
             if ui
                 .add_enabled(changed, egui::Button::new("Discard"))
                 .on_hover_text(
-                    "Give up every edit this project carries for these tables. The rows in \
-                     the database are not touched, and the record of them is kept: Put back \
-                     still works afterwards, and the next Apply puts them back first.",
+                    "Discard every edit this project holds for these tables. The database \
+                     is not changed and the revert record is kept: Restore still works, \
+                     and the next Apply restores the applied rows first.",
                 )
                 .on_disabled_hover_text("This project changes no row of these tables.")
                 .clicked()
@@ -1155,9 +1249,9 @@ fn buttons(
                     .color(theme::INK_FAINT),
             )
             .on_hover_text(
-                "A spell edit is this project's own Spell.dbc against the archives', so \
-                 there is no claim to give up: the spell workspace's Undo and Discard are \
-                 what take one back.",
+                "Client table edits are stored in this project's DBC files, such as \
+                 Spell.dbc, not as rows, so there is nothing to discard here. To revert a \
+                 spell edit, use Undo or Discard in the Spells workspace.",
             );
         }
     }
@@ -1197,6 +1291,7 @@ mod tests {
             .chain(vale_mangos::quest::TABLES.iter())
             .chain(vale_mangos::loot::TABLES.iter())
             .chain(services::TABLES.iter())
+            .chain(places::TABLES.iter())
             .chain(vale_mangos::scripts::TABLES.iter())
             .chain([vale_mangos::eventai::TABLE, vale_mangos::creaturespells::TABLE, vale_mangos::broadcast::TABLE].iter())
             .copied()

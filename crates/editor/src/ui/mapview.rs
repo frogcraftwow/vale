@@ -6,7 +6,7 @@
 //! and that could not create a tile. `crate::pick::Cursor`'s `ground` is
 //! `None` "off the map, over a hole, or over a tile that is not open", so over
 //! a tile that does not exist there is no pointer position, the panel had no
-//! tile to name, and **Create** could never run.
+//! tile to name, and Create could never run.
 //!
 //! It also required the user to fly to where no tile exists, in a viewport
 //! that draws nothing there: no landmark, no ground, and no way to tell 33,48
@@ -20,7 +20,7 @@
 //! ## All tile operations are in this window
 //!
 //! Creating ground, deleting it, copying it, and the three files derived from
-//! a tile are all here. They were first a **Tiles** row on the rail with its
+//! a tile are all here. They were first a Tiles row on the rail with its
 //! own panel, which was wrong for two reasons: the rail lists what the pointer
 //! edits, and none of these operations uses the pointer; and the split left
 //! the map choosing the tiles while a panel elsewhere acted on them. After a
@@ -28,6 +28,15 @@
 //! is. The rail lost the row and the top bar gained a button, because which
 //! tiles this map has is a fact about the session, and the top bar holds
 //! session facts.
+//!
+//! ## Making a new map
+//!
+//! New map… in the top bar's Map menu opens a form for a map that does not
+//! exist yet: its folder, name, type and loading screen. Making it writes a
+//! `Map.dbc` row, a WDT with no tiles and the server's `map_template` row, and
+//! opens the map, so the next step is Create on an empty grid. The form is
+//! drawn here, as a modal, whether or not this window is open. See
+//! [`crate::tools::maps`].
 //!
 //! ## Every operation works on the selection
 //!
@@ -41,9 +50,9 @@
 //! Azeroth claims about 700 of the 4,096 slots, in a region twenty tiles wide.
 //! Drawn as the whole grid, that region was a small patch in the middle of a
 //! window of cells that looked like background, and nothing on screen
-//! identified the rows. The **fit** zoom, which the window opens on, frames
+//! identified the rows. The fit zoom, which the window opens on, frames
 //! the claimed tiles with one empty ring around them, at whatever cell size
-//! fills the window. **far**, **mid** and **near** show the whole grid at
+//! fills the window. far, mid and near show the whole grid at
 //! three sizes, for making ground where the map has none. Rulers along the top
 //! and left name the columns and rows at every zoom, and at every zoom except
 //! the smallest each cell has its edge drawn.
@@ -104,11 +113,11 @@ pub struct MapView {
     pub selection: HashSet<(u32, u32)>,
     /// Where a box-drag began, while one is in progress.
     drag_from: Option<(u32, u32)>,
-    /// The tiles the last **Copy** took, in the coordinates they were taken
+    /// The tiles the last Copy took, in the coordinates they were taken
     /// from.
     ///
     /// A set rather than one tile, so a region can be moved as a region. What
-    /// **Paste** does with it depends on how many tiles it holds:
+    /// Paste does with it depends on how many tiles it holds:
     ///
     /// * one tile fills every selected slot, which lays the same ground over,
     ///   for example, a nine-tile square;
@@ -214,10 +223,12 @@ pub enum Asked {
     ChooseImport,
     /// Import the picture chosen, as the dialog was left.
     Import,
-    /// Make the map one building, the WMO in `Tiles::building_path`.
-    MakeBuilding,
-    /// …or terrain again.
-    MakeTerrain,
+    /// Make the map the form in `Tiles::new_map` describes. See
+    /// `crate::tools::maps`.
+    NewMap,
+    /// Save the form's edits to the map it edits. See
+    /// `crate::tools::maps::save`.
+    SaveMap,
 }
 
 /// The tiles a zoom draws: the top-left tile, how many across and down, and
@@ -287,10 +298,15 @@ pub fn draw(
     minimaps: &vale_assets::tables::minimap::MinimapTiles,
     tiles: &mut crate::tools::tiles::Tiles,
     camera_tile: (u32, u32),
+    camera_at: [f32; 2],
+    screens: &vale_assets::tables::loading::LoadingScreens,
 ) -> (Option<egui::Rect>, Option<Asked>) {
+    // The New map form is opened from the top bar's Map menu and is a modal of
+    // its own, so it is drawn whether or not this window is open.
+    let made = new_map_dialog(ctx, session, tiles, thumbnails, screens, camera_at);
     if !view.open {
         view.was_open = false;
-        return (None, None);
+        return (None, made);
     }
     if !view.was_open {
         view.was_open = true;
@@ -329,7 +345,7 @@ pub fn draw(
         });
     view.open = open;
 
-    (response.map(|r| r.response.rect), asked)
+    (response.map(|r| r.response.rect), asked.or(made))
 }
 
 fn contents(
@@ -372,7 +388,7 @@ fn contents(
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        // **Create** is enabled by empty slots in the selection and **Delete**
+        // Create is enabled by empty slots in the selection and Delete
         // by existing tiles, so each button is enabled only when it has
         // something to act on, and neither silently does nothing.
         let (exist, absent) = view.split(session);
@@ -396,8 +412,8 @@ fn contents(
         if ui
             .add_enabled(exist > 0, egui::Button::new(format!("Copy {exist}")))
             .on_hover_text(
-                "Takes every selected tile that exists. One pastes into every slot; several \
-                 paste as a block, keeping their layout.",
+                "Copies every selected tile that exists. One copied tile pastes into every \
+                 selected slot; several paste as a block, keeping their layout.",
             )
             .clicked()
         {
@@ -410,8 +426,8 @@ fn contents(
                 egui::Button::new("Paste"),
             )
             .on_hover_text(
-                "Rewrites each copied tile to sit where it is going. Its ground, its \
-                 doodads and its buildings all move with it.",
+                "Writes each copied tile into the selected slot, rewriting its positions \
+                 for the new place. Its terrain, doodads and buildings move with it.",
             )
             .clicked()
         {
@@ -421,14 +437,14 @@ fn contents(
             0 => {}
             1 => {
                 let at = view.clipboard[0];
-                theme::note(ui, format!("holding {}, {}", at.0, at.1));
+                theme::note(ui, format!("copied: {}, {}", at.0, at.1));
             }
-            n => theme::note(ui, format!("holding {n} tiles")),
+            n => theme::note(ui, format!("copied: {n} tiles")),
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .add_enabled(!view.selection.is_empty(), egui::Button::new("Clear"))
-                .on_hover_text("Selects nothing.")
+                .on_hover_text("Clears the selection.")
                 .clicked()
             {
                 view.selection.clear();
@@ -724,40 +740,23 @@ fn foot_panel(
         .count();
 
     // What the map is: terrain, or one building with no tiles (most
-    // dungeons). See `vale_edit::wdt::ONE_BUILDING`.
+    // dungeons). See `vale_edit::wdt::ONE_BUILDING`. It is changed in Map
+    // properties, which the button opens.
     ui.horizontal(|ui| {
         label(ui, "Map");
-        match (&tiles.building, whole) {
-            (Some(path), _) => {
+        match &tiles.building {
+            Some(path) => {
                 let leaf = path.rsplit(['\\', '/']).next().unwrap_or(path);
-                ui.label(format!("one building: {leaf}")).on_hover_text(path.clone());
-                if ui
-                    .button("Make it terrain")
-                    .on_hover_text("Remove the building. The map then has no ground until tiles are made.")
-                    .clicked()
-                {
-                    asked = Some(Asked::MakeTerrain);
-                }
+                ui.label(format!("single-WMO map: {leaf}")).on_hover_text(path.clone());
             }
-            (None, 0) => {
-                ui.add(
-                    egui::TextEdit::singleline(&mut tiles.building_path)
-                        .desired_width(260.0)
-                        .hint_text(r"World\wmo\…\name.wmo"),
-                );
-                let ready = tiles.building_path.trim().to_ascii_lowercase().ends_with(".wmo");
-                if ui
-                    .add_enabled(ready, egui::Button::new("Make it one building"))
-                    .on_hover_text("The map becomes this building, as a dungeon is.")
-                    .on_disabled_hover_text("Type the path of a .wmo file.")
-                    .clicked()
-                {
-                    asked = Some(Asked::MakeBuilding);
-                }
-            }
-            (None, n) => {
-                theme::note(ui, format!("terrain, {n} tiles"));
-            }
+            None => theme::note(ui, format!("terrain, {whole} tiles")),
+        }
+        if ui
+            .button("Map properties\u{2026}")
+            .on_hover_text("Edit the map's rows and its layout: terrain or a single WMO.")
+            .clicked()
+        {
+            tiles.new_map = Some(crate::tools::maps::Form::editing(session.map_id, &session.map));
         }
     });
 
@@ -772,7 +771,7 @@ fn foot_panel(
                     .suffix(" yd")
                     .prefix("height "),
             )
-            .on_hover_text("How high the flat ground of a new tile sits.");
+            .on_hover_text("Height of a new tile's flat ground.");
             ui.add(
                 egui::DragValue::new(&mut tiles.area)
                     .speed(1.0)
@@ -784,7 +783,7 @@ fn foot_panel(
                     .desired_width(220.0)
                     .hint_text("Tileset\\…"),
             )
-            .on_hover_text("The one texture a new tile is painted with.");
+            .on_hover_text("The single texture a new tile is painted with.");
         });
         if absent == 0 {
             theme::note(ui, "every selected tile exists");
@@ -806,8 +805,8 @@ fn foot_panel(
         if ui
             .add_enabled(open > 0, egui::Button::new(format!("Rebake ({open})")))
             .on_hover_text(format!(
-                "Recompute the baked shadow of each open selected tile from what stands on \
-                 it. About {} s a tile, in the background.",
+                "Recomputes the baked shadow of each open selected tile from the objects on \
+                 it, in the background. About {} s per tile.",
                 tool::REBAKE_SECONDS
             ))
             .on_disabled_hover_text("None of the selection is open: fly to it first.")
@@ -815,13 +814,13 @@ fn foot_panel(
         {
             asked = Some(Asked::Rebake);
         }
-        ui.checkbox(&mut tiles.cast_from_ground, "also from the ground")
+        ui.checkbox(&mut tiles.cast_from_ground, "include terrain shadow")
             .on_hover_text(
-                "Also cast shadow from the terrain onto itself. Off by default: \
-                 measured against two shipped tiles, hull-cast shadow matches \
-                 their MCSH at 1.2-1.4x the base rate and terrain-cast shadow at \
-                 0.4-0.9x, which is chance or worse, so the shipped bakes do not \
-                 appear to include it.",
+                "Also bakes shadow cast by the terrain onto itself. Off by default, \
+                 because the shipped bakes do not appear to include it: against two \
+                 shipped tiles, hull-cast shadow matches their MCSH at 1.2-1.4x the \
+                 base rate and terrain-cast shadow at 0.4-0.9x, which is chance or \
+                 worse.",
             );
     });
 
@@ -838,7 +837,7 @@ fn foot_panel(
         if tiles.drawing {
             if ui
                 .button("Stop minimaps")
-                .on_hover_text("Stop after the tile being drawn. What is drawn is kept.")
+                .on_hover_text("Stops after the tile being drawn. Tiles already drawn are kept.")
                 .clicked()
             {
                 tiles.stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -902,7 +901,7 @@ fn foot_panel(
         }
         if ui
             .add_enabled(open > 0, egui::Button::new("Import…"))
-            .on_hover_text("Choose a PNG to put on the selection: a height map or a blend map, any size.")
+            .on_hover_text("Choose a PNG to import onto the selection: a height map or a blend map, any size.")
             .on_disabled_hover_text("None of the selection is open: fly to it first.")
             .clicked()
         {
@@ -938,6 +937,397 @@ fn foot_panel(
         theme::note(ui, tiles.said.clone());
     }
     asked
+}
+
+/// The New map form. Answers `NewMap` when Make is pressed with nothing
+/// wrong; Cancel drops the form.
+fn new_map_dialog(
+    ctx: &egui::Context,
+    session: &EditSession,
+    tiles: &mut crate::tools::tiles::Tiles,
+    thumbnails: &mut Thumbnails,
+    screens: &vale_assets::tables::loading::LoadingScreens,
+    camera_at: [f32; 2],
+) -> Option<Asked> {
+    use vale_assets::tables::map::INSTANCE_TYPES;
+    let form = tiles.new_map.as_mut()?;
+    let mut asked = None;
+    let mut close = false;
+    let response = egui::Modal::new(egui::Id::new("map-new")).show(ctx, |ui| {
+        ui.set_width(420.0);
+        let title = match form.editing {
+            None => "New map".to_string(),
+            Some(id) => format!("Map properties \u{2014} {} ({id})", form.directory),
+        };
+        ui.label(egui::RichText::new(title).strong().size(14.0));
+        ui.add_space(4.0);
+        if form.editing.is_some() && !form.loaded {
+            theme::note(ui, "reading the map's rows…");
+            if ui.button("Cancel").clicked() {
+                close = true;
+            }
+            return;
+        }
+        const FOLDER: &str = "The map's folder, World\\Maps\\<folder>\\, which is also the start \
+                              of every tile's file name. Letters, digits and underscores, \
+                              starting with a letter. It cannot be changed afterwards without \
+                              renaming every tile.";
+        const NAME: &str = "The map's name, as the loading screen, the map menu and the server \
+                            show it. It can be changed later in Map.dbc.";
+        const TYPE: &str = "The map's instance type. A world map is open ground everyone \
+                            shares. A dungeon or raid is an instance: each group gets its own \
+                            copy, entered through a portal, and it takes a player limit, a ghost \
+                            entrance and a parent. A battleground is an instance the \
+                            battleground queue sends players to.";
+        const PLAYERS: &str = "How many characters one copy of the instance holds: 5 for a \
+                               dungeon, 10, 20 or 40 for a raid. 0 for no limit.";
+        theme::row_about(ui, "folder", FOLDER, |ui| match form.editing {
+            None => {
+                ui.text_edit_singleline(&mut form.directory).on_hover_text(FOLDER);
+            }
+            Some(_) => {
+                ui.label(egui::RichText::new(&form.directory).color(theme::INK))
+                    .on_hover_text(FOLDER);
+            }
+        });
+        theme::row_about(ui, "name", NAME, |ui| {
+            ui.text_edit_singleline(&mut form.name).on_hover_text(NAME);
+        });
+        theme::row_about(ui, "type", TYPE, |ui| {
+            egui::ComboBox::from_id_salt("map-new-type")
+                .selected_text(
+                    INSTANCE_TYPES
+                        .iter()
+                        .find(|(value, _)| *value == form.instance_type)
+                        .map_or("?", |(_, name)| *name),
+                )
+                .show_ui(ui, |ui| {
+                    for (value, name) in INSTANCE_TYPES {
+                        ui.selectable_value(&mut form.instance_type, value, name);
+                    }
+                })
+                .response
+                .on_hover_text(TYPE);
+        });
+        if form.instance_type != 0 {
+            theme::row_about(ui, "players", PLAYERS, |ui| {
+                ui.add(egui::DragValue::new(&mut form.max_players).range(0..=40))
+                    .on_hover_text(PLAYERS);
+            });
+        }
+        let open_screen = screens.screen_of(session.map_id);
+        let screen_name = |id: Option<u32>| match id.and_then(|id| screens.screen(id)) {
+            Some((name, _)) => name.to_string(),
+            None => id.map_or_else(|| "none".to_string(), |id| format!("row {id}")),
+        };
+        const SCREEN: &str = "The picture shown while a character is loading into the map: a \
+                              LoadingScreens row. Left alone, the new map uses the open map's.";
+        theme::row_about(ui, "loading screen", SCREEN, |ui| {
+            let chosen = match form.loading_screen {
+                None => format!("the open map's ({})", screen_name(open_screen)),
+                Some(id) => screen_name(Some(id)),
+            };
+            ui.label(egui::RichText::new(chosen).color(theme::INK));
+            let label = match form.choosing_screen {
+                true => "Close",
+                false => "Choose\u{2026}",
+            };
+            if ui.button(label).on_hover_text(SCREEN).clicked() {
+                form.choosing_screen = !form.choosing_screen;
+            }
+        });
+        if form.choosing_screen {
+            if let Some(choice) = screen_picker(ui, thumbnails, screens, form.loading_screen, open_screen) {
+                form.loading_screen = choice;
+                form.choosing_screen = false;
+            }
+        }
+        edit_rows(ui, form);
+        if form.is_instance() {
+            instance_rows(ui, session, form, camera_at);
+        }
+        if form.editing.is_none() {
+            ui.checkbox(&mut form.zone, "Create zone")
+                .on_hover_text(
+                    "An AreaTable zone named after the map, which the map's row names as its \
+                     area. Paint it onto the ground with the Areas tool.",
+                );
+            ui.checkbox(&mut form.open_it, "Open after creating")
+                .on_hover_text("Switches the editor to the new map once it is created, saving the open map first.");
+        }
+        let problem = form.problem(&session.maps);
+        if let Some(why) = &problem {
+            ui.label(egui::RichText::new(why).size(theme::SMALL).color(theme::WARN));
+        }
+        theme::note(
+            ui,
+            match form.editing {
+                None => "The server needs the map's tiles extracted (Server files) and a restart \
+                         before a character can stand on it.",
+                Some(_) => "Map.dbc changes reach the client through the project's archive. \
+                            map_template changes are applied from the Server panel, and the \
+                            server reads them on .reload map_template.",
+            },
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let (button, answer) = match form.editing {
+                None => ("Create", Asked::NewMap),
+                Some(_) => ("Save", Asked::SaveMap),
+            };
+            if ui.add_enabled(problem.is_none(), egui::Button::new(button)).clicked() {
+                asked = Some(answer);
+            }
+            if ui.button("Cancel").clicked() {
+                close = true;
+            }
+        });
+    });
+    if close || response.should_close() {
+        tiles.new_map = None;
+    }
+    asked
+}
+
+/// The rest of the map's `Map.dbc` row, a raid's reset and the layout, on
+/// both forms; and on an existing map's, where its server row came from.
+fn edit_rows(ui: &mut egui::Ui, form: &mut crate::tools::maps::Form) {
+    use crate::tools::maps::ServerRow;
+    const PVP: &str = "Map.dbc field 3. 4 of the 44 shipped maps set it.";
+    const LEVELS: &str = "Map.dbc fields 13 and 14: the lowest and highest character level \
+                          for the map. 0 is none. 4 of the 44 shipped maps set them.";
+    const AREA: &str = "The zone the map belongs to: an AreaTable id. Written to Map.dbc \
+                        field 19 and to the server's map_template.linked_zone. 0 is none.";
+    const DESCRIPTION: &str = "Map.dbc fields 20 and 29. Most shipped maps leave both empty.";
+    const RESET: &str = "map_template.reset_delay: days between the raid's resets. 0 is none.";
+    const LAYOUT: &str = "Terrain: the map is drawn from its ADT tiles. Single WMO: the map is \
+                          one WMO and has no tiles, as most dungeons are; the WDT's header flag \
+                          says so and names the WMO. Only a map with no tiles can be made a \
+                          single-WMO map.";
+    theme::row_about(ui, "PvP", PVP, |ui| {
+        ui.checkbox(&mut form.pvp, "").on_hover_text(PVP);
+    });
+    theme::row_about(ui, "levels", LEVELS, |ui| {
+        ui.add(egui::DragValue::new(&mut form.min_level).range(0..=255).prefix("min "))
+            .on_hover_text(LEVELS);
+        ui.add(egui::DragValue::new(&mut form.max_level).range(0..=255).prefix("max "))
+            .on_hover_text(LEVELS);
+    });
+    // A new map's zone is made by Create zone unless that is off.
+    if form.editing.is_some() || !form.zone {
+        theme::row_about(ui, "zone", AREA, |ui| {
+            ui.add(egui::DragValue::new(&mut form.area).speed(1.0)).on_hover_text(AREA);
+        });
+    }
+    for (n, label) in ["description 0", "description 1"].into_iter().enumerate() {
+        theme::row_about(ui, label, DESCRIPTION, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut form.descriptions[n])
+                    .desired_rows(1)
+                    .desired_width(f32::INFINITY),
+            )
+            .on_hover_text(DESCRIPTION);
+        });
+    }
+    if form.instance_type == 2 {
+        theme::row_about(ui, "reset", RESET, |ui| {
+            ui.add(egui::DragValue::new(&mut form.reset_delay).range(0..=365).suffix(" days"))
+                .on_hover_text(RESET);
+        });
+    }
+    theme::row_about(ui, "layout", LAYOUT, |ui| {
+        ui.radio_value(&mut form.single_wmo, false, "Terrain").on_hover_text(LAYOUT);
+        ui.radio_value(&mut form.single_wmo, true, "Single WMO").on_hover_text(LAYOUT);
+    });
+    if form.single_wmo {
+        theme::row(ui, "WMO", |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut form.wmo)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(r"World\wmo\…\name.wmo"),
+            )
+            .on_hover_text("The archive path of the WMO's root file.");
+        });
+    }
+    if form.editing.is_none() {
+        return;
+    }
+    if form.single_wmo != !form.wmo_was.is_empty() || (form.single_wmo && form.wmo.trim() != form.wmo_was) {
+        theme::note(
+            ui,
+            "A layout change is written to the project's WDT when saved, is not on the \
+             undo history, and shows after the map is opened again.",
+        );
+    }
+    let server = match &form.server {
+        ServerRow::Unread | ServerRow::Reading => "reading the server's map_template row…".to_string(),
+        ServerRow::Found { key, created: true, .. } => format!("map_template {}: created by this project", key.text()),
+        ServerRow::Found { key, created: false, .. } => {
+            format!("map_template {}: from the database, with this project's edits", key.text())
+        }
+        ServerRow::Missing => "the database has no map_template row for this map; the server columns \
+                               will not be saved"
+            .to_string(),
+        ServerRow::Unreachable(why) => format!("map_template could not be read ({why}); the server \
+                                               columns will not be saved"),
+    };
+    theme::note(ui, server);
+}
+
+/// A dungeon's or raid's parent and ghost entrance on the New map form.
+/// `camera_at` is where the camera stands on the open map, north and west.
+fn instance_rows(ui: &mut egui::Ui, session: &EditSession, form: &mut crate::tools::maps::Form, camera_at: [f32; 2]) {
+    use vale_mangos::map::CONTINENTS;
+    let name_of = |id: u32| {
+        session
+            .maps
+            .iter()
+            .find(|(map, _)| *map == id)
+            .map_or_else(|| format!("map {id}"), |(_, dir)| format!("{dir} ({id})"))
+    };
+    const GHOST: &str = "Where this dungeon's entrance is out in the world: a point on a \
+                         continent, usually in front of the portal.\n\n\
+                         A character who dies inside cannot release back into the dungeon. \
+                         Their ghost is sent to the graveyard nearest this point, the corpse \
+                         arrow points here, and walking into the portal brings them back to \
+                         life inside. Without it, a ghost has no entrance to return to.\n\n\
+                         It must be on a continent. Set the camera over the portal and \
+                         press Use camera position, or enter the point below.";
+    const PARENT: &str = "Only for a dungeon whose entrance is inside another dungeon, rather \
+                          than out in the world: name that outer dungeon here.\n\n\
+                          A character whose corpse lies in the outer dungeon may then walk \
+                          their ghost into this one. Leave it at none for a dungeon entered \
+                          from a continent, which is nearly all of them.";
+    theme::row_about(ui, "ghost entrance", GHOST, |ui| {
+        let chosen = match form.ghost {
+            None => "none".to_string(),
+            Some((map, _)) => name_of(map),
+        };
+        egui::ComboBox::from_id_salt("map-new-ghost")
+            .selected_text(chosen)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(form.ghost.is_none(), "none").clicked() {
+                    form.ghost = None;
+                }
+                for map in CONTINENTS {
+                    let at = form.ghost.map_or([0.0, 0.0], |(_, at)| at);
+                    if ui.selectable_label(form.ghost.map(|(m, _)| m) == Some(map), name_of(map)).clicked() {
+                        form.ghost = Some((map, at));
+                    }
+                }
+            })
+            .response
+            .on_hover_text(GHOST);
+        let here = CONTINENTS.contains(&session.map_id);
+        if ui
+            .add_enabled(here, egui::Button::new("Use camera position"))
+            .on_hover_text(
+                "Uses the point the camera is over on the open map. Open the continent and \
+                 fly to the portal first.",
+            )
+            .on_disabled_hover_text("The open map is not a continent.")
+            .clicked()
+        {
+            form.ghost = Some((session.map_id, camera_at));
+        }
+    });
+    if let Some((_, at)) = form.ghost.as_mut() {
+        theme::row(ui, "", |ui| {
+            const AXES: &str = "The ghost entrance on its continent, in yards: north and \
+                                west, as .gps and the status line give them.";
+            ui.label("north").on_hover_text(AXES);
+            ui.add(egui::DragValue::new(&mut at[0]).speed(1.0).max_decimals(1))
+                .on_hover_text(AXES);
+            ui.label("west").on_hover_text(AXES);
+            ui.add(egui::DragValue::new(&mut at[1]).speed(1.0).max_decimals(1))
+                .on_hover_text(AXES);
+        });
+    }
+    theme::row_about(ui, "parent", PARENT, |ui| {
+        let chosen = match form.parent {
+            0 => "none".to_string(),
+            id => name_of(id),
+        };
+        egui::ComboBox::from_id_salt("map-new-parent")
+            .selected_text(chosen)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut form.parent, 0, "none");
+                for (id, dir) in session.maps.iter().filter(|(id, _)| !CONTINENTS.contains(id)) {
+                    ui.selectable_value(&mut form.parent, *id, format!("{dir} ({id})"));
+                }
+            })
+            .response
+            .on_hover_text(PARENT);
+    });
+}
+
+/// The loading screens as pictures to choose from, the open map's first.
+/// Answers the choice when one is clicked: `Some(None)` for the open map's,
+/// `Some(Some(id))` for a row.
+fn screen_picker(
+    ui: &mut egui::Ui,
+    thumbnails: &mut Thumbnails,
+    screens: &vale_assets::tables::loading::LoadingScreens,
+    chosen: Option<u32>,
+    open_screen: Option<u32>,
+) -> Option<Option<u32>> {
+    // The pictures are 4:3, drawn at the thumbnail cache's icon size across.
+    const CELL: egui::Vec2 = egui::vec2(128.0, 96.0);
+    /// Three across, which fits the form's 420 points.
+    const COLUMNS: usize = 3;
+    let mut rows: Vec<(u32, &str, &str)> = screens.screens().collect();
+    rows.sort_by_key(|(id, _, _)| *id);
+    let mut picked = None;
+    egui::ScrollArea::vertical()
+        .id_salt("map-new-screens")
+        .max_height(300.0)
+        .show(ui, |ui| {
+            // A grid of a fixed width: wrapped rows in a modal that sizes to
+            // its contents never wrap, and the form grew across the window.
+            egui::Grid::new("map-new-screen-grid").num_columns(COLUMNS).spacing([6.0, 6.0]).show(ui, |ui| {
+                let open = open_screen.and_then(|id| screens.screen(id)).map(|(_, path)| path);
+                let entries = std::iter::once((None, "the open map's", open))
+                    .chain(rows.iter().map(|(id, name, path)| (Some(*id), *name, Some(*path))));
+                for (n, (id, name, path)) in entries.enumerate() {
+                    if n > 0 && n % COLUMNS == 0 {
+                        ui.end_row();
+                    }
+                    ui.vertical(|ui| {
+                        ui.set_width(CELL.x);
+                        let (rect, response) = ui.allocate_exact_size(CELL, egui::Sense::click());
+                        ui.painter().rect_filled(rect, 3.0, theme::SUNK);
+                        if let Some(path) = path {
+                            thumbnails.want_at(path, super::thumbnails::ICON_SIDE);
+                            if let Some(texture) = thumbnails.get_at(path, super::thumbnails::ICON_SIDE) {
+                                ui.painter().image(
+                                    texture,
+                                    rect.shrink(2.0),
+                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                        }
+                        let selected = id == chosen;
+                        if selected || response.hovered() {
+                            let colour = match selected {
+                                true => theme::INK,
+                                false => theme::INK_FAINT,
+                            };
+                            ui.painter().rect_stroke(rect, 3.0, egui::Stroke::new(2.0, colour), egui::StrokeKind::Inside);
+                        }
+                        let caption = match id {
+                            Some(id) => format!("{id} {name}"),
+                            None => name.to_string(),
+                        };
+                        ui.label(egui::RichText::new(caption).size(theme::SMALL).color(theme::INK));
+                        if response.on_hover_text(path.unwrap_or("")).clicked() {
+                            picked = Some(id);
+                        }
+                    });
+                }
+            });
+        });
+    picked
 }
 
 /// The import's confirmation: the picture, what it is used as, where it
@@ -994,7 +1384,7 @@ fn import_dialog(
                 if open < selected.len() {
                     theme::note(
                         ui,
-                        format!("{open} of the {} selected tiles are open; the rest are left", selected.len()),
+                        format!("{open} of the {} selected tiles are open; the rest are not changed", selected.len()),
                     );
                 }
             }
@@ -1017,11 +1407,11 @@ fn import_dialog(
                 theme::note(
                     ui,
                     match pending.range_in_file {
-                        true => "from the file",
-                        false => "the selected tiles' lowest and highest ground now",
+                        true => "range read from the file",
+                        false => "range: the selected tiles' current lowest and highest ground",
                     },
                 );
-                ui.checkbox(&mut tiles.objects_follow, "Objects follow the ground");
+                ui.checkbox(&mut tiles.objects_follow, "Doodads and WMOs follow the ground");
             }
             Kind::Blends => {
                 theme::note(ui, "changes how each chunk's textures blend; adds no texture");

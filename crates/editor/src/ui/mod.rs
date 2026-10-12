@@ -11,6 +11,10 @@
 //! rail.rs       the subject list: what the editor edits now and what it will
 //!               edit
 //! inspector.rs  the panel beside the viewport: the chosen tool's controls
+//! members.rs    a group selection's members as a folded list, in which one
+//!               can be made the primary or taken out
+//! context.rs    the right-click menu over the viewport: each world tool's
+//!               one-click operations on what was clicked
 //! thumbnails.rs the pictures the inspector draws in a list, decoded a few per
 //!               frame
 //! data.rs       the workspace a table is edited in, which replaces the
@@ -47,8 +51,12 @@
 //! services.rs   the Vendor and Trainer windows of a selected creature: its
 //!               own list and its template's, each row drawn as the server
 //!               reads it, with the reasons it would skip one
+//! gossip.rs     the gossip window: a creature's menu, what it says and the
+//!               options it offers, each leading to the next menu
+//! conditions.rs the condition window: one row of `conditions`, its values
+//!               named by its type, opened from any form that names one
 //! rowform.rs    the widgets all of those forms are built from: how a column
-//!               of each kind is drawn, and what typing into one produces. The
+//!               of each type is drawn, and what typing into one produces. The
 //!               form itself stays with its subject
 //! reference.rs  a column that names a row of another table, as the creature
 //!               and game object forms draw it: the picker button, the name
@@ -63,9 +71,14 @@
 //! flightpaths.rs the flight path tool's panel: the selected node and its
 //!               paths, the selected path and its points, and what a click on
 //!               the ground is armed to make
-//! bands.rs      the one table no reference reaches: a light's eighteen
-//!               colours and six numbers over the day, each drawn as the day
-//!               it produces rather than as sixteen pairs of numbers
+//! triggers.rs   the area trigger tool's panel: the selected trigger's shape
+//!               and place, and its teleport, inn and quest rows
+//! graveyards.rs the graveyard tool's panel: the selected safe place, its
+//!               facing, and the zones it serves
+//! bands.rs      the form for a light's bands, the one table no other row
+//!               references: a light's eighteen colours and six numbers over
+//!               the day, each drawn as the day it produces rather than as
+//!               sixteen pairs of numbers
 //! lab.rs        the attachment lab's card and pane: an effect's model on a
 //!               body, with the handles that move it
 //! hovercard.rs  the card beside the pointer that names the creature or game
@@ -86,9 +99,9 @@
 //! ## Layout: four docked regions
 //!
 //! The controls are docked rather than held in one floating `egui::Window`. A
-//! floating window listing a map drop-down, a coordinate readout, three
-//! "go to" rows, the brush, the history, the project and the playtest in no
-//! particular order reads as a debug window.
+//! single floating window that lists a map drop-down, a coordinate readout,
+//! three "go to" rows, the brush, the history, the project and the playtest
+//! has no fixed order and no grouping by purpose.
 //!
 //! The shell has four docked regions with one job each:
 //!
@@ -106,7 +119,7 @@
 //! ```
 //!
 //! A new control goes in the top bar or the inspector by this rule: the bar
-//! holds session state and the inspector holds the thing being edited. Which
+//! holds session state and the inspector holds what is being edited. Which
 //! project, which map, whether the work is saved, whether the game is running
 //! go in the bar. A brush radius, a placement's rotation and the undo stack go
 //! in the inspector.
@@ -140,8 +153,9 @@
 //! click on the inspector therefore fell through to the world and moved the
 //! selection.
 //!
-//! `is_pointer_over_area` has no `any_down()` term and asks the right
-//! question, but it also fails here: for a widget on the background layer egui
+//! `is_pointer_over_area` has no `any_down()` term, so it would answer
+//! correctly on the press frame, but it also fails here: for a widget on the
+//! background layer egui
 //! compares the pointer against `root_ui_available_rect`, which is written by
 //! `Context::run_ui`. bevy_egui does not call `run_ui`, because it drives
 //! `begin_pass`/`end_pass` itself. With the rectangle unset egui takes its
@@ -150,15 +164,20 @@
 //!
 //! The shell therefore keeps its own answer. [`Viewport`] is the rectangle the
 //! four panels leave, written here where the panels are drawn and read by
-//! every tool. [`Viewport::holds`] is the one place the question is asked.
+//! every tool. [`Viewport::holds`] is the one function that decides whether a
+//! pointer position is over the world.
 
 pub mod bands;
 pub mod behaviour;
+pub mod conditions;
+pub mod context;
 pub mod creatures;
 pub mod data;
 pub mod displays;
 pub mod flightpaths;
 pub mod gameobjects;
+pub mod gossip;
+pub mod graveyards;
 pub mod hovercard;
 pub mod icons;
 pub mod inspector;
@@ -167,6 +186,7 @@ pub mod lab;
 pub mod loot;
 pub mod manifest;
 pub mod mapview;
+pub mod members;
 pub mod popover;
 pub mod quests;
 pub mod rail;
@@ -180,6 +200,7 @@ pub mod sync;
 pub mod theme;
 pub mod thumbnails;
 pub mod topbar;
+pub mod triggers;
 pub mod viewbar;
 pub mod waypoints;
 
@@ -202,7 +223,7 @@ use vale_client::render::focus::WorldFocus;
 
 /// The part of the window the chrome leaves for the world, in window points.
 ///
-/// It has two parts because the chrome has two kinds of element. The docked
+/// It has two parts because the chrome has two types of element. The docked
 /// panels shrink the root `Ui`, so what they leave is one rectangle. A popover,
 /// a window or a modal floats over that rectangle and shrinks nothing, so its
 /// rectangle is listed separately; without that, a press on a popover's
@@ -335,12 +356,13 @@ pub struct Playing<'w> {
 pub struct Editing<'w> {
     pub(crate) terrain: ResMut<'w, Terrain>,
     pub(crate) grading: ResMut<'w, crate::tools::grade::Grading>,
+    pub(crate) road: ResMut<'w, crate::tools::road::RoadTool>,
     pub(crate) measuring: ResMut<'w, crate::tools::measure::Measuring>,
     pub(crate) shading: ResMut<'w, crate::tools::shading::Shading>,
     pub(crate) textures: ResMut<'w, Textures>,
     pub(crate) selection: ResMut<'w, Selection>,
-    /// The doodad and WMO tools' drag state, for the one thing each panel
-    /// tells it: that a group change made in the panel's fields needs its
+    /// The doodad and WMO tools' drag state. Each panel uses it for one
+    /// message: that a group change made in the panel's fields needs its
     /// members settled and, for buildings, their boxes re-fitted.
     pub(crate) doodad_held: ResMut<'w, crate::tools::doodads::Held>,
     pub(crate) wmos: ResMut<'w, crate::tools::wmos::Selection>,
@@ -370,6 +392,13 @@ pub struct Editing<'w> {
     /// The flight path subject: the nodes and paths on the map and what is
     /// selected. See [`crate::tools::flightpaths`].
     pub(crate) flightpaths: ResMut<'w, crate::tools::flightpaths::Flightpaths>,
+    /// The area trigger subject: the triggers on the map, what is selected,
+    /// and the server rows read for them. See [`crate::tools::triggers`].
+    pub(crate) triggers: ResMut<'w, crate::tools::triggers::Triggers>,
+    /// The safe place (graveyard) subject's state, which has the same shape
+    /// as the area trigger subject's. See
+    /// [`crate::tools::graveyards`].
+    pub(crate) graveyards: ResMut<'w, crate::tools::graveyards::Graveyards>,
     /// The world half of the creature subject: the map's spawns, which is
     /// selected, and the two rows behind it. See [`crate::tools::creatures`].
     pub(crate) creatures: ResMut<'w, crate::tools::creatures::Creatures>,
@@ -398,6 +427,11 @@ pub struct Editing<'w> {
     /// The Vendor and Trainer windows' state: the creature they are about,
     /// and what its lists hold. See [`crate::tools::services`].
     pub(crate) services: ResMut<'w, crate::tools::services::Services>,
+    /// The gossip window's state: the creature it is about and the menus it
+    /// has read. See [`crate::tools::gossip`].
+    pub(crate) gossip: ResMut<'w, crate::tools::gossip::Gossip>,
+    /// The condition window's state. See [`crate::tools::conditions`].
+    pub(crate) conditions: ResMut<'w, crate::tools::conditions::Conditions>,
     /// The time of day the world is showing. Read-only here: the view bar
     /// sets the hour, and the panels read it so a band's day strip can mark
     /// the viewport's current hour on itself.
@@ -412,6 +446,10 @@ pub struct Editing<'w> {
     /// The command line, for the two flags that open something a press would
     /// otherwise have to open: `--projects` here, `--row` in the browser.
     pub(crate) args: Res<'w, crate::Args>,
+    /// The right-click menu over the viewport. See [`context`].
+    pub(crate) menu: ResMut<'w, crate::context::ContextMenu>,
+    /// What the doodad and WMO tools have copied, for the menu's Paste here.
+    pub(crate) clipboard: Res<'w, crate::tools::group::Clipboard>,
 }
 
 /// What the view bar reads and writes, as one parameter.
@@ -440,6 +478,9 @@ pub struct Viewing<'w> {
     /// The ground guides, which the view bar's Guides menu switches. See
     /// [`crate::tools::guides`].
     guides: ResMut<'w, crate::tools::guides::Guides>,
+    /// The top-down map view, which the view bar's MAP button switches. See
+    /// [`crate::camera::TopDown`].
+    top_down: ResMut<'w, crate::camera::TopDown>,
     icons: Res<'w, icons::Icons>,
     /// Which world tool the World part of the top bar returns to. See
     /// [`rail::Rail`].
@@ -500,7 +541,7 @@ fn draw(
     // A playtest has two layouts, chosen by [`crate::playtest::ShellOpen`].
     // Shut, the whole window is the game's and the bar is one row of controls.
     // Open, the panels are drawn as they are while editing, so there is no
-    // second layout to learn for the same subjects. Three things change: the
+    // second layout to learn for the same subjects. Three parts differ: the
     // rail is not drawn, the top bar's World part is disabled with the reason
     // on its hover text, and the right-hand end of the top bar holds the
     // playtest's controls.
@@ -578,6 +619,7 @@ fn draw(
                     step: &playing.step,
                 },
                 &mut editing.mapview.open,
+                &mut editing.tiles.new_map,
                 &mut topbar::Subjects {
                     tool: &mut tool,
                     rail: &mut viewing.rail,
@@ -626,12 +668,19 @@ fn draw(
                 &baseline,
                 &edited_overlay,
                 viewing.navmesh.on,
+                viewing.top_down.on,
                 &viewing.guides,
             )
         }
         #[cfg(not(feature = "diagnostics"))]
         {
-            viewbar::scripted(&edited_world, &baseline, viewing.navmesh.on, &viewing.guides)
+            viewbar::scripted(
+                &edited_world,
+                &baseline,
+                viewing.navmesh.on,
+                viewing.top_down.on,
+                &viewing.guides,
+            )
         }
     };
     egui::Panel::bottom("editor-status")
@@ -643,6 +692,7 @@ fn draw(
         });
 
     let mut edited_guides = viewing.guides.clone();
+    let mut map_view = viewing.top_down.on;
     egui::Panel::bottom("editor-view")
         .frame(bar(theme::PANEL))
         .show(&mut root, |ui| {
@@ -659,6 +709,8 @@ fn draw(
                     drawn: &viewing.drawn,
                     navmesh: &mut viewing.navmesh,
                     guides: &mut edited_guides,
+                    map_view: &mut map_view,
+                    editing: playing.state.editing(),
                     areas_shown: *tool == Tool::Areas,
                     open_guides: editing.args.guides_menu
                         && time.elapsed_secs() > 3.0
@@ -672,11 +724,15 @@ fn draw(
     if edited_guides != *viewing.guides {
         *viewing.guides = edited_guides;
     }
+    if map_view != viewing.top_down.on {
+        viewing.top_down.on = map_view;
+    }
 
     // The rail is not drawn over a playtest. Every tile on it keeps the
     // viewport, and no such tool can be used then; see
-    // [`Tool::survives_playtest`](crate::tools::Tool::survives_playtest). The
-    // workspace control on the top bar is the whole of the choice.
+    // [`Tool::survives_playtest`](crate::tools::Tool::survives_playtest).
+    // During a playtest the workspace control on the top bar is the only way
+    // to choose a tool.
     if !in_world {
         egui::Panel::left("editor-rail")
             .exact_size(theme::RAIL_WIDTH)
@@ -945,6 +1001,8 @@ fn draw(
         &minimaps,
         &mut editing.tiles,
         camera_tile,
+        [focus.position.x, focus.position.y],
+        &assets.loading_screens(),
     );
     if asked.is_some() {
         editing.tiles.asked = asked;
@@ -974,6 +1032,10 @@ fn draw(
     let world_rect = viewport.rect.unwrap_or(egui::Rect::NOTHING);
     let corner = rail::pointer(&ctx, world_rect, &mut tool, &mut viewing.rail, &viewing.icons);
     viewport.floating.extend(corner);
+    // The right-click menu, on the root context so it is not clipped to a
+    // panel. Its area is added to the floating list with the other areas at
+    // the end of this function.
+    context::draw(&ctx, session, &mut editing, &assets, viewport.zoom);
 
     // The creature template's own window, drawn on the root context like the
     // map window: a window inside a panel is clipped to the panel, and this
@@ -995,6 +1057,7 @@ fn draw(
                 loot: &mut editing.loot,
                 behaviour: &mut editing.behaviour,
                 services: &mut editing.services,
+                gossip: &mut editing.gossip,
                 server: &playing.server,
                 server_panel: &mut popovers.server,
                 assets: &assets,
@@ -1134,10 +1197,10 @@ fn draw(
                                 value: spawn.entry.to_string(),
                                 label: format!("Set {name} to {}", spawn.entry),
                                 about: format!(
-                                    "Write creature_template.{name} = {}, which is the \
-                                     convention the shipped rows follow. It is a creature \
-                                     edit: applied from the Creatures block of the Server \
-                                     panel, and it needs the server restarted.",
+                                    "Write creature_template.{name} = {}, the convention \
+                                     the shipped rows follow. This is a creature edit: \
+                                     apply it from the Creatures block of the Server \
+                                     panel, then restart the server.",
                                     spawn.entry
                                 ),
                                 gesture: "Edit creature",
@@ -1150,10 +1213,10 @@ fn draw(
                     title: spawn.label(),
                     about: match template {
                         Some(_) => format!(
-                            "creature_template entry {}: every spawn of it drops these.",
+                            "creature_template entry {}: every spawn of this creature drops this loot.",
                             spawn.entry
                         ),
-                        None => "reading the template row\u{2026}".to_string(),
+                        None => "reading the creature_template row\u{2026}".to_string(),
                     },
                     sets,
                 }
@@ -1174,10 +1237,10 @@ fn draw(
                         value: spawn.entry.to_string(),
                         label: format!("Set lootId to {}", spawn.entry),
                         about: format!(
-                            "Write gameobject_template.data1 = {}, which is the convention \
-                             the shipped rows follow. It is a game object edit: applied from \
-                             the Objects block of the Server panel, and it needs the server \
-                             restarted.",
+                            "Write gameobject_template.data1 = {}, the convention the \
+                             shipped rows follow. This is a game object edit: apply it from \
+                             the Objects block of the Server panel, then restart the \
+                             server.",
                             spawn.entry
                         ),
                         gesture: "Edit game object",
@@ -1188,12 +1251,12 @@ fn draw(
                     about: match (known, looted) {
                         (None, _) => "No gameobject_template row at this content patch.".to_string(),
                         (Some(known), false) => format!(
-                            "type is {}, which the server takes no loot from: only a chest and \
-                             a fishing hole have a lootId it reads.",
+                            "type is {}, which has no loot: the server reads lootId only for \
+                             chests and fishing holes.",
                             known.type_word()
                         ),
                         (Some(_), true) => format!(
-                            "gameobject_template entry {}: every spawn of it holds these.",
+                            "gameobject_template entry {}: every spawn of this object contains this loot.",
                             spawn.entry
                         ),
                     },
@@ -1227,10 +1290,10 @@ fn draw(
                 column: "flags",
                 value: (known.flags | LOOTABLE).to_string(),
                 label: "Set LOOTABLE".to_string(),
-                about: "Write item_template.flags with LOOTABLE (0x4) added, which is what \
-                        makes the client offer to open the item and the server read this \
-                        set. It is an item edit: applied from the Items block of the \
-                        Server panel, live on the reload."
+                about: "Add LOOTABLE (0x4) to item_template.flags. With this flag the client \
+                        offers to open the item and the server reads this loot set. This is \
+                        an item edit: apply it from the Items block of the Server panel; it \
+                        is live after .reload item_template."
                     .to_string(),
                 gesture: "Edit item",
             }));
@@ -1252,7 +1315,7 @@ fn draw(
                          reads no item_loot_template for it and the client will not open it.",
                         known.entry
                     ),
-                    false => format!("item_template entry {}: opening it gives these.", known.entry),
+                    false => format!("item_template entry {}: opening the item gives this loot.", known.entry),
                 },
                 sets,
             }
@@ -1350,6 +1413,69 @@ fn draw(
             }),
         _ => None,
     };
+    // The gossip window follows the selected creature on the same terms, and
+    // stays open on a menu opened by number under any tool. The texts it
+    // shows are read by the behaviour tool, which holds `broadcast_text`.
+    editing.gossip.about = match *tool {
+        Tool::Creatures => editing.services.about.as_ref().map(|services| {
+            let template = editing
+                .creatures
+                .template
+                .as_ref()
+                .filter(|held| held.entry == services.entry);
+            let gossip_menu_id = {
+                use vale_mangos::creature::RowValue;
+                session
+                    .server_edits
+                    .get(vale_mangos::creature::TEMPLATE, &services.template_key, "gossip_menu_id")
+                    .and_then(|value| value.trim().parse::<i64>().ok())
+                    .or_else(|| template.and_then(|held| held.row.integer("gossip_menu_id")))
+                    .map_or(0, |value| value.max(0) as u32)
+            };
+            crate::tools::gossip::About {
+                entry: services.entry,
+                label: services.label.clone(),
+                template_key: services.template_key.clone(),
+                gossip_menu_id,
+                npc_flags: services.npc_flags,
+                at: editing
+                    .creatures
+                    .selected
+                    .and_then(|guid| editing.creatures.spawns.iter().find(|spawn| spawn.guid == guid))
+                    .map(|spawn| [spawn.at.x, spawn.at.y]),
+            }
+        }),
+        _ => None,
+    };
+    editing.behaviour.other_texts = match editing.gossip.open {
+        true => editing.gossip.broadcast_texts(&session.server_edits),
+        false => Vec::new(),
+    };
+    editing.behaviour.numbering_texts = editing.gossip.open || editing.gossip.numbering;
+    gossip::make_pending(session, &mut editing.gossip, &mut editing.behaviour, time.elapsed_secs_f64());
+    let gossip_window = gossip::window(
+        &ctx,
+        gossip::Subject {
+            session,
+            gossip: &mut editing.gossip,
+            behaviour: &mut editing.behaviour,
+            quests: &mut editing.quests,
+            now: time.elapsed_secs_f64(),
+        },
+    );
+    viewport.floating.extend(gossip_window);
+    let condition_window = conditions::window(
+        &ctx,
+        conditions::Subject {
+            session,
+            conditions: &mut editing.conditions,
+            quests: &mut editing.quests,
+            assets: &assets,
+            thumbnails: &mut editing.thumbnails,
+            now: time.elapsed_secs_f64(),
+        },
+    );
+    viewport.floating.extend(condition_window);
     if *tool == Tool::Creatures {
         let service_windows = services::windows(
             &ctx,
@@ -1365,7 +1491,9 @@ fn draw(
         );
         viewport.floating.extend(service_windows);
     }
-    if *tool == Tool::Creatures {
+    // The script window also opens from a trigger's script id, and from the
+    // gossip window's script columns under any tool.
+    if matches!(*tool, Tool::Creatures | Tool::Triggers) || editing.gossip.open {
         let behaviour_windows = behaviour::windows(
             &ctx,
             behaviour::Subject {
@@ -1414,7 +1542,7 @@ fn draw(
         use crate::tools::areas::Ask;
         use crate::tools::tables::{self, area};
         match (session.open_table(&assets, area::TABLE), ask) {
-            (false, _) => session.status = "AreaTable did not open".to_string(),
+            (false, _) => session.status = "AreaTable could not be opened".to_string(),
             (true, Ask::Edit(id)) => {
                 if editing.browser.follow(session, area::TABLE, id) {
                     editing.browser.followed_in = true;
@@ -1433,9 +1561,9 @@ fn draw(
                 session.status = match id {
                     Some(id) => {
                         editing.areas.brush.area = id;
-                        format!("area {id} is made and on the brush: Edit\u{2026} names it")
+                        format!("area {id} created and set as the brush area; use Edit\u{2026} to name it")
                     }
-                    None => "the area was not made".to_string(),
+                    None => "the area could not be created".to_string(),
                 };
             }
         }
@@ -1448,7 +1576,7 @@ fn draw(
         editing.areas.search.clear();
         *tool = Tool::Areas;
         viewing.rail.follow(Tool::Areas);
-        session.status = format!("area {id} is on the brush");
+        session.status = format!("area {id} set as the brush area");
     }
     // A part of a workspace chosen on the strip at the head of its list.
     let part = editing.items.switch_to.take().or_else(|| editing.browser.switch_to.take());
@@ -1759,9 +1887,9 @@ fn playtest_bar(
                 if ui
                     .button("Live Edit")
                     .on_hover_text(
-                        "Ctrl+E. Open the editor's panels over the running game: \
-                         change a spell, an item, a quest or any table, save, and \
-                         the next thing to read it is the edited one. The world \
+                        "Ctrl+E. Open the editor panels over the running playtest. \
+                         Edit a spell, item, quest or any table and save; the client \
+                         uses the edited version the next time it reads it. The world \
                          tools are not available.",
                     )
                     .clicked()
@@ -1771,7 +1899,7 @@ fn playtest_bar(
                 }
                 if ui
                     .button("End Playtest")
-                    .on_hover_text("Ctrl+P. Drops the connection and returns to the tools.")
+                    .on_hover_text("Ctrl+P. Disconnects from the server and returns to the editor.")
                     .clicked()
                 {
                     crate::playtest::stop(state, client, auto, session);

@@ -59,6 +59,7 @@
 
 use super::Tool;
 use crate::server::fresh::Fresh;
+use crate::marks::{Look, Marks};
 use crate::session::EditSession;
 use vale_client::render::focus::WorldFocus;
 use vale_client::world::camera::WorldCamera;
@@ -550,6 +551,12 @@ pub struct Creatures {
     spawn_at: Option<(u64, bool)>,
     /// Draw the near ones as models, or as markers only.
     pub show_models: bool,
+    /// Mark every near spawn, or only the selected, hovered and grouped ones.
+    /// Off is for a place with so many spawns near the camera that their
+    /// markers slow the frame. Picking does not depend on it: the tool picks
+    /// by arithmetic on the pointer's ray, so an unmarked spawn can still be
+    /// clicked.
+    pub show_markers: bool,
     /// How many models at once — see the module comment.
     pub model_budget: usize,
     /// Draw a row of service icons over each near creature that offers one.
@@ -608,6 +615,7 @@ impl Default for Creatures {
             spawn_task: None,
             spawn_at: None,
             show_models: true,
+            show_markers: true,
             // 200 creatures is about what a busy city block holds, and is
             // well inside what the entity pass draws in a session. The panel
             // changes it and shows the count.
@@ -1023,7 +1031,7 @@ impl Creatures {
             &key,
             wanted.as_ref(),
             Some(crate::session::Gesture {
-                label: "Keep spawn",
+                label: "Cancel spawn removal",
                 subject: &subject,
                 now,
             }),
@@ -1471,12 +1479,12 @@ pub fn plan_template_move(
     }
     if to > creature::MAX_ENTRY {
         return Err(format!(
-            "{to} is past {}, which is all `entry` can hold",
+            "{to} is above {}, the largest value `entry` can hold",
             creature::MAX_ENTRY
         ));
     }
     if taken && to != subject.read_entry {
-        return Err(format!("entry {to} is already a creature"));
+        return Err(format!("creature_template entry {to} already exists"));
     }
     Ok(Some((
         subject.key(),
@@ -1657,7 +1665,7 @@ fn rebuild_created(
             wander: number("wander_distance").unwrap_or(0.0),
             movement_type: number("movement_type").unwrap_or(0.0) as u32,
             // Until the template has been read the row is labelled by its
-            // entry and has no model, so it is drawn as a ring on the ground.
+            // entry and has no model, so it is drawn as a dome.
             // See [`learn_the_created`].
             name: known.map(|known| known.name.clone()),
             subname: known.and_then(|known| known.subname.clone()),
@@ -2074,6 +2082,16 @@ const REMOVED: Color = Color::srgb(0.95, 0.30, 0.30);
 /// members in it too.
 pub(crate) const MEMBER: Color = Color::srgb(0.95, 0.78, 0.50);
 
+/// The dome drawn over a spawn with no model, in yards: a size in the world,
+/// drawn through `Marks::visible_radius` so a far one is still a dot. A spawn
+/// is picked by its distance from the pointer's ray in pixels, so a far one is
+/// as easy to click as a near one.
+const DOME_RADIUS: f32 = 0.6;
+
+/// The smallest dome drawn around a spawn's model, in yards: about the
+/// height of a person's waist, so the dome reads as around the model.
+const DOME_AROUND_MODEL: f32 = 1.2;
+
 /// How far up from the row's position the marker's body reaches, in yards.
 ///
 /// A creature model stands on its position, so the pointer is aimed at
@@ -2207,7 +2225,7 @@ fn place_one(
     // The surface and not the ground, so that clicking a bridge, a dock or an
     // inn's upper floor stands the creature on it. See [`crate::pick`].
     let Some(ground) = cursor.surface else {
-        session.status = "nothing under the pointer — nothing placed".into();
+        session.status = "no surface under the pointer; nothing placed".into();
         return;
     };
     // The ghost's own facing, so the row written matches the model that was
@@ -2563,25 +2581,27 @@ fn sql_float(value: f32) -> String {
     vale_mangos::sql::float(value)
 }
 
-/// Draw a marker for every near spawn, and the selected one's wander circle.
+/// Draw a dome over every near spawn, and the selected one's facing and wander
+/// circle.
+///
+/// A spawn drawn as a model gets a translucent dome around its feet; a spawn
+/// with no model gets a smaller, near-opaque dome where the model would
+/// stand.
+///
+/// A mark that is being aimed at is [`Look::Ghosted`], so it shows faintly
+/// through a wall. Every other mark is [`Look::Solid`] and hidden by whatever is
+/// nearer the camera: the tool marks up to a thousand spawns, and in a forest
+/// ghosts of all of them would cover the trees.
 fn draw(
-    // Two gizmo groups. A mark that is being aimed at is drawn in front of
-    // the world; a mark that only shows where something is is drawn inside
-    // it and hidden by whatever is nearer the camera. See
-    // [`super::gizmo::WorldMarks`].
-    mut handles: Gizmos<super::gizmo::EditorHandles>,
-    mut marks: Gizmos<super::gizmo::WorldMarks>,
+    mut marks: ResMut<Marks>,
     creatures: Res<Creatures>,
     session: Option<Res<EditSession>>,
     tool: Res<Tool>,
     state: Res<crate::playtest::Playtest>,
-    camera: Query<&GlobalTransform, With<WorldCamera>>,
 ) {
     if !state.editing() || *tool != Tool::Creatures {
         return;
     }
-    let Ok(camera) = camera.single() else { return };
-    let eye = Vec3::from(vale_client::render::axes::to_wow(camera.translation()));
 
     let edits = session.as_ref().map(|session| &session.server_edits);
     // Sorted once and searched per marker — see `super::doodads::draw_marker`.
@@ -2598,6 +2618,15 @@ fn draw(
         let Some(base) = creatures.base_spawn(*index) else {
             continue;
         };
+        // With the markers off, only what is aimed at, tested before the
+        // edits are looked up so the rest cost nothing. See
+        // [`Creatures::show_markers`].
+        let wanted = creatures.selected == Some(base.guid)
+            || creatures.hovered == Some(base.guid)
+            || super::group::holds(&members, base.guid);
+        if !creatures.show_markers && !wanted {
+            continue;
+        }
         let with_edits = edits.and_then(|edits| base.with_edits(edits));
         let spawn = with_edits.as_ref().unwrap_or(base);
         let chosen = creatures.selected == Some(spawn.guid);
@@ -2627,33 +2656,21 @@ fn draw(
         };
         let chosen_or_member = chosen || member;
         let at = vale_client::render::axes::to_bevy(spawn.at.to_array());
-        let radius = ((spawn.at.distance(eye)) * 0.012).clamp(0.35, 4.0);
-        let ring = Isometry3d::new(at, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2));
-        // A vertical line up from the ring, so a spawn on a hillside is seen
-        // to stand on it rather than lie flat on the image. Only for spawns
-        // with no model; a model shows where it stands.
-        let top = vale_client::render::axes::to_bevy((spawn.at + Vec3::Z * BODY).to_array());
-        // The two builders have different types, so this is two arms rather
-        // than one expression choosing a `Gizmos`.
-        match chosen_or_member || under {
-            true => {
-                handles.circle(ring, radius, colour);
-                if !has_model {
-                    handles.line(at, top, colour);
-                }
-            }
-            false => {
-                marks.circle(ring, radius, colour);
-                if !has_model {
-                    marks.line(at, top, colour);
-                }
-            }
+        let radius = marks.visible_radius(at, DOME_RADIUS);
+        let look = match chosen_or_member || under {
+            true => Look::Ghosted,
+            false => Look::Solid,
+        };
+        match has_model {
+            // Around the model's feet, never smaller than a person.
+            true => marks.dome(at, radius.max(DOME_AROUND_MODEL), colour.with_alpha(0.4), look),
+            false => marks.dome(at, radius, colour.with_alpha(0.85), look),
         }
         if spawn.is_removed() {
             // A cross through it, because the colour alone has to be learned
             // and this is the one state in which a mistake deletes a row.
-            // Drawn in front of the world, so a creature marked for removal
-            // is not hidden by a wall in front of it.
+            // Ghosted, so a creature marked for removal still shows through a
+            // wall in front of it.
             let arm = radius * 1.4;
             for (dx, dy) in [(1.0, 1.0), (1.0, -1.0)] {
                 let from = vale_client::render::axes::to_bevy(
@@ -2662,7 +2679,7 @@ fn draw(
                 let to = vale_client::render::axes::to_bevy(
                     (spawn.at - Vec3::new(arm * dx, arm * dy, -BODY / 2.0)).to_array(),
                 );
-                handles.line(from, to, REMOVED);
+                marks.wide_line(from, to, 1.6, REMOVED, Look::Ghosted);
             }
         }
         if chosen {
@@ -2670,16 +2687,14 @@ fn draw(
             // the row the form has open, and both are hard to read as numbers:
             // 4.71 radians does not show a direction.
             let facing = Vec3::new(spawn.orientation.cos(), spawn.orientation.sin(), 0.0);
+            let from = vale_client::render::axes::to_bevy((spawn.at + Vec3::Z * 0.2).to_array());
             let nose = vale_client::render::axes::to_bevy(
                 (spawn.at + facing * (radius * 3.0) + Vec3::Z * 0.2).to_array(),
             );
-            handles.line(at, nose, Color::srgb(1.0, 0.95, 0.6));
+            let thickness = marks.line_radius(from) * 1.6;
+            marks.arrow(from, nose, thickness, Color::srgb(1.0, 0.95, 0.6), Look::Ghosted);
             if spawn.wander > 0.1 {
-                handles.circle(
-                    Isometry3d::new(at, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
-                    spawn.wander,
-                    Color::srgba(1.0, 0.82, 0.25, 0.5),
-                );
+                marks.flat_ring(at, spawn.wander, Color::srgba(1.0, 0.82, 0.25, 0.5), Look::Ghosted);
             }
         }
     }

@@ -5,15 +5,15 @@
 //! ## One window for every holder
 //!
 //! A loot row is the same nine columns whichever of the nine tables it is in,
-//! so there is one window and three buttons that open it: *Loot* on a
-//! selected creature, on a selected game object, and on the open item. What
+//! so there is one window. Three Loot buttons open it: one on a selected
+//! creature, one on a selected game object, and one on the open item. What
 //! differs is which sets the holder's columns name, and that is a row of tabs:
 //! a creature's `loot_id`, `pickpocket_loot_id` and `skinning_loot_id`; an
 //! object's `lootId`; an item's own entry and its `disenchant_id`. The window
 //! follows the selection, as the quest window does — see
 //! [`crate::tools::loot::Window`], which the shell rebuilds each frame.
 //!
-//! ## A row is drawn as the server reads it
+//! ## How a row's columns are drawn
 //!
 //! The columns are drawn as what they mean rather than as the two signed
 //! numbers the table holds: a chance and a `quest` checkbox for
@@ -29,8 +29,8 @@
 //! ## Edits go to the project, not the database
 //!
 //! An edit goes into the project's store and onto the undo stack; a save
-//! writes `sql\loot.sql`; *Apply* is on the bar's *Server…* with the other
-//! subjects' — see [`super::sync`] and [`crate::server::loot`].
+//! writes `sql\loot.sql`; the Apply button is in the bar's Server… menu with
+//! the other subjects'. See [`super::sync`] and [`crate::server::loot`].
 
 use super::theme;
 use super::thumbnails::Thumbnails;
@@ -57,6 +57,10 @@ const CHANCE: f32 = 90.0;
 
 /// How wide a count or condition cell is. Both hold small integers.
 const NUMBER: f32 = 44.0;
+
+/// How wide the line saying what a condition tests is. Longer lines are cut,
+/// and the whole line is on hover.
+const CONDITION: f32 = 130.0;
 
 /// How wide the group drop-down is: room for `Group 12`.
 const GROUP: f32 = 76.0;
@@ -124,7 +128,7 @@ pub fn window(ctx: &egui::Context, mut subject: Subject<'_>) -> Option<egui::Rec
         // Wide enough for every cell of a row at the widths above, and tall
         // enough for the head, the tabs and about eight rows of 33 points.
         // A longer set scrolls; dragging the corner shows more of it.
-        .default_size([680.0, 460.0])
+        .default_size([900.0, 460.0])
         .default_pos([300.0, 120.0])
         .resizable(true)
         .frame(
@@ -214,7 +218,7 @@ fn set_head(ui: &mut egui::Ui, subject: &mut Subject<'_>, set: Set, fix: Option<
     if set.entry == 0 {
         ui.label(
             egui::RichText::new(format!(
-                "{} is 0, so the server takes nothing from this table for it.",
+                "{} is 0, so the server reads no loot from this table for the selection.",
                 table.keyed_by
             ))
             .small()
@@ -253,8 +257,8 @@ fn reference_head(ui: &mut egui::Ui, subject: &mut Subject<'_>, reference: u32) 
                 .color(theme::INK_DIM),
         )
         .on_hover_text(
-            "A set shared between loot tables: any row whose mincountOrRef is this entry \
-             negated rolls it. Editing it changes every set that names it.",
+            "A set shared between loot tables: a row whose mincountOrRef is this entry, \
+             negated, rolls it. Editing it changes every set that references it.",
         );
     });
 }
@@ -350,22 +354,23 @@ fn percent(value: f32) -> String {
 /// Draws a group's heading, and one line under it that says what the group
 /// does.
 ///
-/// Group 0 is not a group: every row in it rolls its own chance and any number
-/// of them can drop. A numbered group drops at most one row per roll — see
+/// The rows in group 0 are not grouped: each rolls its own chance, and any
+/// number of them can drop. A numbered group drops at most one row per roll — see
 /// [`crate::tools::loot::Odds`], which is the server's own arithmetic.
 fn group_heading(ui: &mut egui::Ui, group: u32, odds: crate::tools::loot::Odds) {
     let (title, meaning) = match group {
         0 => (
-            "Rolls alone".to_string(),
+            "No group".to_string(),
             "Each row rolls its own chance, so any number of these can drop together."
                 .to_string(),
         ),
         n => {
-            let title = format!("Group {n} \u{2014} one of these per roll");
+            let title = format!("Group {n} \u{2014} at most one row drops per roll");
             let meaning = match (odds.stated > 100.0, odds.stated > 0.0, odds.equal) {
                 (true, _, _) => format!(
-                    "The stated chances sum to {}%, over 100: a row whose chance starts past \
-                     100 is never reached, and the server logs the group at start.",
+                    "The stated chances sum to {}%, over 100: a row whose running total \
+                     starts above 100% is never reached, and the server logs an error for \
+                     the group at start.",
                     percent(odds.stated)
                 ),
                 (false, false, 0) => "No row has a chance, so nothing drops.".to_string(),
@@ -483,9 +488,9 @@ fn row(
         let switched = ui
             .checkbox(&mut quest, egui::RichText::new("quest").small())
             .on_hover_text(
-                "Offered only to a player on a quest that asks for the item: the chance \
-                 stored negative. On a reference the server reads it as an ordinary \
-                 chance and says so at load.",
+                "Quest drop: dropped only for a player whose active quest requires the \
+                 item. Stored as a negative chance. On a reference row the server treats \
+                 it as an ordinary chance and logs it at load.",
             )
             .changed();
         if (dragged.changed() && chance != shown.entry.chance) || switched {
@@ -563,7 +568,7 @@ fn row(
         let mut chosen: Option<u32> = None;
         let next = groups.iter().copied().max().unwrap_or(0) + 1;
         let word = |group: u32| match group {
-            0 => "Alone".to_string(),
+            0 => "No group".to_string(),
             n => format!("Group {n}"),
         };
         ui.add_enabled_ui(shown.life != Life::Delete, |ui| {
@@ -591,16 +596,17 @@ fn row(
                 })
                 .response
                 .on_hover_text(
-                    "groupid. Alone rolls this row's own chance; in a group, one row of the \
-                     group drops per roll. It is part of the row's key, so a change removes \
+                    "groupid. With no group, the row rolls its own chance; in a group, at \
+                     most one row of the group drops per roll. It is part of the row's key, so a change removes \
                      the row and creates it again in the new group, as one undo entry.",
                 )
-                .on_disabled_hover_text("Keep the row before moving it.");
+                .on_disabled_hover_text("Clear the removal mark with keep before changing the group.");
         });
         if let Some(group) = chosen.filter(|group| *group != shown.entry.group) {
             subject.loot.regroup(subject.session, set, shown, group, now);
         }
-        // The condition, as its number.
+        // The condition: its number, then what it tests and the buttons that
+        // choose or make one.
         let mut condition = shown.entry.condition as i64;
         let conditioned = ui
             .add_sized(
@@ -608,7 +614,16 @@ fn row(
                 egui::DragValue::new(&mut condition).range(0..=i64::from(u32::MAX)).prefix("c"),
             )
             .on_hover_text("condition_id: a row of `conditions` the player must meet, or 0.");
-        if conditioned.changed() && condition != shown.entry.condition as i64 {
+        let typed = (conditioned.changed() && condition != shown.entry.condition as i64).then_some(condition as u32);
+        let key = shown.entry.key().text();
+        let answered = super::conditions::cell(
+            ui,
+            egui::Id::new(("loot-condition", set.table, &key)),
+            &format!("{} {key} condition_id", set.table),
+            shown.entry.condition,
+            Some(CONDITION),
+        );
+        if let Some(condition) = typed.or(answered) {
             subject
                 .loot
                 .set_column(subject.session, set, shown, "condition_id", condition.to_string(), now);
@@ -714,7 +729,7 @@ fn reference_link(ui: &mut egui::Ui, subject: &mut Subject<'_>, reference: u32) 
     ));
     if link
         .on_hover_text(format!(
-            "Rolls {} {reference}, a set shared with every other row that names it. Open it.",
+            "Rolls {} {reference}, a set shared by every row that references it. Click to open it.",
             loot::REFERENCE
         ))
         .clicked()
@@ -730,7 +745,7 @@ fn adders(ui: &mut egui::Ui, subject: &mut Subject<'_>, set: Set) {
         if ui
             .small_button("+ item\u{2026}")
             .on_hover_text(format!(
-                "Add a row to {} {}: one of the item, at 100%, in no group.",
+                "Add a row to {} {}: a count of 1 of the chosen item, at 100%, in no group.",
                 set.table, set.entry
             ))
             .clicked()

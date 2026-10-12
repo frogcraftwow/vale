@@ -1820,8 +1820,9 @@ fn quantise(live: &[[f32; 3]]) -> Vec<crate::adt::colours::Colour> {
 /// it is a copy that disagrees with the file the moment anything else writes.
 #[derive(Debug, Default)]
 pub struct Working {
-    /// Per chunk, per layer, per texel: alpha in 0..255 with the fraction kept.
-    chunks: std::collections::HashMap<usize, Vec<Vec<f32>>>,
+    /// Per chunk: the blend maps as this stroke found them and as it has left
+    /// them, and how much of the stroke each texel has taken. See [`Wet`].
+    chunks: std::collections::HashMap<usize, Wet>,
     /// Per chunk, per vertex: the `MCCV` multiplier with the fraction kept.
     ///
     /// A second map rather than a second `Working`, because the two are the same
@@ -1829,6 +1830,39 @@ pub struct Working {
     /// shapes differ — 145 vertices against a layer's 4,096 texels — so they
     /// cannot share a map, and nothing wants them to: no stroke paints both.
     shading: std::collections::HashMap<usize, Vec<[f32; 3]>>,
+}
+
+/// One chunk's share of a stroke, at full precision.
+///
+/// The maps are worked out from `start` and `cover` rather than stepped
+/// frame by frame. See [`PaintBrush`], where the reason is.
+#[derive(Debug)]
+struct Wet {
+    /// Per layer, per texel: alpha in 0..255 as the stroke found it.
+    start: Vec<Vec<f32>>,
+    /// …and as the stroke has left it, with the fraction kept.
+    now: Vec<Vec<f32>>,
+    /// Per texel: how much of the stroke it has taken, 0 to 1.
+    cover: Vec<f32>,
+}
+
+impl Wet {
+    fn seeded(maps: &[Vec<u8>]) -> Wet {
+        let start = as_working(maps);
+        Wet {
+            now: start.clone(),
+            start,
+            cover: vec![0.0; ALPHA_LEN],
+        }
+    }
+
+    /// Give the chunk a layer the stroke has just added, transparent.
+    fn grow_to(&mut self, layers: usize) {
+        while self.start.len() < layers {
+            self.start.push(vec![0.0; ALPHA_LEN]);
+            self.now.push(vec![0.0; ALPHA_LEN]);
+        }
+    }
 }
 
 impl Working {
@@ -1877,6 +1911,22 @@ impl Working {
 /// with the chunk drawn has to notice — see [`Edit::changes_the_texture_set`].
 /// A chunk already carrying [`alpha::MAX_LAYERS`] cannot take another and is
 /// skipped rather than having one of its layers thrown away.
+///
+/// ## A stroke paints up to its footprint and no further
+///
+/// Each texel takes a share of the stroke, `cover`, which rises toward the
+/// footprint's weight there at [`Self::strength`] and never past it. The maps
+/// are the stroke's starting maps blended toward the texture by that share.
+/// So a held brush settles on its own profile: full in the core, the falloff's
+/// fraction at the edge.
+///
+/// The first version moved every texel toward full opacity and used the weight
+/// only as the speed. A texel near the rim got there slowly, but it got there:
+/// holding the brush, or passing over the same ground twice, painted out to the
+/// whole radius. WoWEdit's brush keeps the paint about its inner ring with a
+/// large outer one, and was reported as the more precise of the two. A new
+/// stroke starts from the maps the last one left, so strokes still build on
+/// each other.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaintBrush {
     /// Yards.
@@ -1891,7 +1941,8 @@ pub struct PaintBrush {
     /// circle, and neither wants the other.
     pub shape: Shape,
     /// A fraction of the remaining distance a second, so a held brush converges
-    /// on the texture rather than stepping to it.
+    /// on its footprint rather than stepping to it. How far it goes is the
+    /// footprint's; see the section above.
     pub strength: f32,
     pub falloff: Falloff,
     /// **The archive path of the tileset, not an `MTEX` index.**
@@ -1957,10 +2008,18 @@ impl Default for PaintBrush {
     fn default() -> PaintBrush {
         PaintBrush {
             radius: 12.0,
-            core: 0.0,
+            // A third of the radius at full strength, with the falloff over
+            // the rest: WoWEdit's inner ring, about where it draws one. Since
+            // a stroke paints no further than its footprint, a brush with no
+            // core is solid at one point only.
+            core: 0.35,
             shape: Shape::Circle,
             strength: 3.0,
-            falloff: Falloff::Smooth,
+            // Falling from the moment it leaves the core and nearly gone well
+            // before the rim. Smooth is flat where it leaves the core, so a
+            // band outside the inner ring painted at nearly full strength and
+            // the brush read as heavy beside WoWEdit's.
+            falloff: Falloff::Sharp,
             texture: String::new(),
             effect_id: 0,
             opacity: 1.0,
@@ -1989,13 +2048,40 @@ impl PaintBrush {
         at: [f32; 2],
         seconds: f32,
     ) -> Painted {
+        // The brush's own footprint: its shape, its falloff curve and its
+        // core, around the point.
+        let weight = |x: f32, y: f32| {
+            let distance = self.shape.distance(x - at[0], y - at[1]);
+            self.falloff.over(distance / self.radius, self.core)
+        };
+        let chunks = self.chunks_under(tile, at);
+        self.paint_where(tile, working, &chunks, seconds, weight)
+    }
+
+    /// **Paint with a footprint the caller describes**: `weight` gives each
+    /// point in world x and y a share of the stroke, 0 to 1, and `chunks` are
+    /// the chunks it can be above 0 in. [`Self::stroke`] is this with the
+    /// brush's own circle; a road is this with the distance from its centre
+    /// line. The radius, shape, falloff and core are not read here.
+    ///
+    /// With `seconds` at 1 and a strength of 1, one call moves every texel
+    /// all the way to its weight's share of the opacity, which is a footprint
+    /// written once rather than rubbed in.
+    pub fn paint_where(
+        &self,
+        tile: &mut AdtFile,
+        working: &mut Working,
+        chunks: &[usize],
+        seconds: f32,
+        weight: impl Fn(f32, f32) -> f32,
+    ) -> Painted {
         let mut painted = Painted::default();
         if self.texture.is_empty() {
             return painted;
         }
-        for index in self.chunks_under(tile, at) {
+        for &index in chunks {
             let before = ChunkPaint::capture(tile, index);
-            match self.paint_chunk(tile, working, index, at, seconds) {
+            match self.paint_chunk(tile, working, index, seconds, &weight) {
                 Step::Painted => {}
                 Step::Nothing => continue,
                 Step::Based => painted.based.push(index),
@@ -2032,13 +2118,25 @@ impl PaintBrush {
         tile: &mut AdtFile,
         working: &mut Working,
         index: usize,
-        at: [f32; 2],
         seconds: f32,
+        weight: &dyn Fn(f32, f32) -> f32,
     ) -> Step {
         let Some(chunk) = tile.chunk(index) else {
             return Step::Nothing;
         };
         let origin = chunk.head().position();
+        // Each texel's share of the step, worked out first: a chunk the
+        // footprint does not reach at all is left before anything below
+        // gives it a layer, makes the texture its base or reports it full.
+        let weights: Vec<f32> = (0..ALPHA_LEN)
+            .map(|texel| {
+                let [x, y] = alpha::texel_position(origin, texel % ALPHA_SIDE, texel / ALPHA_SIDE);
+                weight(x, y).clamp(0.0, 1.0)
+            })
+            .collect();
+        if weights.iter().all(|&w| w == 0.0) {
+            return Step::Nothing;
+        }
         let mut paint = alpha::paint(chunk);
 
         // **A chunk with no `MCLY` at all takes this texture as its base.**
@@ -2109,8 +2207,10 @@ impl PaintBrush {
                 paint.maps[layer] = vec![0u8; ALPHA_LEN];
                 // The stroke's own copy of that layer was the old texture's.
                 if let Some(wet) = working.chunks.get_mut(&index) {
-                    if let Some(map) = wet.get_mut(layer) {
-                        map.fill(0.0);
+                    for maps in [&mut wet.start, &mut wet.now] {
+                        if let Some(map) = maps.get_mut(layer) {
+                            map.fill(0.0);
+                        }
                     }
                 }
                 reused = true;
@@ -2140,19 +2240,20 @@ impl PaintBrush {
         let wet = working
             .chunks
             .entry(index)
-            .or_insert_with(|| as_working(&paint.maps));
-        while wet.len() < paint.maps.len() {
-            wet.push(vec![0.0; ALPHA_LEN]);
-        }
+            .or_insert_with(|| Wet::seeded(&paint.maps));
+        wet.grow_to(paint.maps.len());
 
+        // Clamped so a long frame cannot overshoot and oscillate, which is
+        // the same guard `Brush::moved` puts on its two converging modes.
+        let rate = (self.strength * seconds).clamp(0.0, 1.0);
+        let opacity = self.opacity.clamp(0.0, 1.0);
         for texel in 0..ALPHA_LEN {
             let (tx, ty) = (texel % ALPHA_SIDE, texel / ALPHA_SIDE);
             let [x, y] = alpha::texel_position(origin, tx, ty);
-            // **In the brush's own shape** — see [`Shape`]. A texel is 0.52
-            // yards, so a square brush here has a genuinely straight edge
-            // rather than a stepped one.
-            let distance = self.shape.distance(x - at[0], y - at[1]);
-            let weight = self.falloff.over(distance / self.radius, self.core);
+            // **In the footprint's own shape.** A texel is 0.52 yards, so a
+            // square brush here has a genuinely straight edge rather than a
+            // stepped one.
+            let weight = weights[texel];
             if weight == 0.0 {
                 continue;
             }
@@ -2163,27 +2264,30 @@ impl PaintBrush {
                 true => ((self.density - speckle(x, y, self.grain)) * 12.0 + 0.5).clamp(0.0, 1.0),
                 false => 1.0,
             };
-            if patch == 0.0 {
+            // The texel's share of the stroke rises toward the footprint here
+            // and never past it; see the section on [`PaintBrush`].
+            let reach = weight * patch;
+            let cover = &mut wet.cover[texel];
+            if reach <= *cover {
                 continue;
             }
-            // Clamped so a long frame cannot overshoot and oscillate, which is
-            // the same guard `Brush::moved` puts on its two converging modes.
-            let step = (self.strength * weight * patch * seconds).clamp(0.0, 1.0);
+            *cover += (reach - *cover) * rate;
+            let cover = *cover;
             if self.erase {
                 // The texture's own layer toward transparent, and nothing
                 // else: what is under it shows again.
-                wet[target][texel] -= wet[target][texel] * step;
+                wet.now[target][texel] = wet.start[target][texel] * (1.0 - cover);
                 continue;
             }
-            let opacity = self.opacity.clamp(0.0, 1.0);
             // The target layer toward the opacity asked for, from either
             // side…
-            wet[target][texel] += (255.0 * opacity - wet[target][texel]) * step;
+            let from = wet.start[target][texel];
+            wet.now[target][texel] = from + (255.0 * opacity - from) * cover;
             // …and everything painted over it toward transparent, which is the
             // half a brush that "does not work" is missing. Scaled by the
             // opacity, so a faint stroke also uncovers the texture faintly.
-            for above in target + 1..wet.len() {
-                wet[above][texel] -= wet[above][texel] * step * opacity;
+            for above in target + 1..wet.now.len() {
+                wet.now[above][texel] = wet.start[above][texel] * (1.0 - cover * opacity);
             }
         }
 
@@ -2192,7 +2296,7 @@ impl PaintBrush {
         // `encode_alpha_maps` is what applies that on the way out.
         let mut moved = false;
         for (layer, map) in paint.maps.iter_mut().enumerate() {
-            let Some(source) = wet.get(layer) else { continue };
+            let Some(source) = wet.now.get(layer) else { continue };
             for (texel, slot) in map.iter_mut().enumerate() {
                 let value = source[texel].clamp(0.0, 255.0).round() as u8;
                 if *slot != value {
@@ -2352,6 +2456,10 @@ fn with_neighbours(index: usize) -> Vec<usize> {
 
 /// A ramp between two points — the one shape a round brush cannot make.
 pub mod grade;
+
+/// A road along a run of points: the ground graded along it and its
+/// textures painted.
+pub mod road;
 
 /// Carrying the placements that stand on ground an edit moved.
 pub mod follow;

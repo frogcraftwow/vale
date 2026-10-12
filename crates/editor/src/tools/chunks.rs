@@ -772,7 +772,16 @@ fn stitch_in(session: &mut EditSession, cells: &BTreeSet<Cell>, how: Stitch) -> 
         });
         moved.insert(cell);
     }
-    let changed = moved.len();
+    // Locked vertices are put back before the shading is worked out, so the
+    // shading across the tiles' sides reads the heights that stay.
+    for (coord, list) in edits.iter_mut() {
+        session.hold_locked(*coord, list);
+    }
+    let changed = edits
+        .values()
+        .flatten()
+        .filter(|edit| matches!(edit, Edit::Heights { .. }))
+        .count();
     reshade_across(session, &moved, &mut edits);
     commit(session, edits, false);
     changed
@@ -882,8 +891,8 @@ pub fn set_area(session: &mut EditSession, cells: &BTreeSet<Cell>, area: u32) ->
 /// Set or clear the impassable flag on every selected chunk.
 pub fn set_impassable(session: &mut EditSession, cells: &BTreeSet<Cell>, on: bool) -> usize {
     let label = match on {
-        true => "Impassable",
-        false => "Passable",
+        true => "Set impassable",
+        false => "Clear impassable",
     };
     over(session, cells, label, false, |tile, chunk| {
         let before = tile.chunk(chunk)?.head().flags();
@@ -902,8 +911,8 @@ pub fn set_impassable(session: &mut EditSession, cells: &BTreeSet<Cell>, on: boo
 /// Cut all sixteen squares of every selected chunk, or put all sixteen back.
 pub fn set_holes(session: &mut EditSession, cells: &BTreeSet<Cell>, cut: bool) -> usize {
     let (label, after) = match cut {
-        true => ("Cut chunks", u16::MAX),
-        false => ("Patch chunks", 0),
+        true => ("Cut holes in chunks", u16::MAX),
+        false => ("Fill holes in chunks", 0),
     };
     over(session, cells, label, true, |tile, chunk| {
         let before = tile.chunk(chunk)?.head().holes();
@@ -955,7 +964,7 @@ fn texture_id(tile: &AdtFile, path: &str) -> Option<u32> {
 /// Make `path` the base texture of every selected chunk, under whatever each
 /// already carries. Every blend map is kept.
 pub fn set_base(session: &mut EditSession, cells: &BTreeSet<Cell>, path: &str) -> usize {
-    let label = format!("Base {}", super::textures::leaf(path));
+    let label = format!("Set base texture {}", super::textures::leaf(path));
     over(session, cells, &label, true, |tile, chunk| {
         repaint(tile, chunk, |tile, paint| {
             let id = tile.name_texture(path);
@@ -983,7 +992,7 @@ pub fn swap_texture(
     to: &str,
 ) -> usize {
     let label = format!(
-        "Swap {} to {}",
+        "Replace {} with {}",
         super::textures::leaf(from),
         super::textures::leaf(to)
     );
@@ -1395,6 +1404,41 @@ pub fn paste(
     written
 }
 
+/// The clip pasted centred on `at`, with the panel's parts, height and stitch
+/// settings, as one undo entry; the pasted footprint becomes the selection.
+/// Answers the status line. `Ctrl+V` and the right-click menu's Paste here
+/// both come here.
+pub fn paste_at(session: &mut EditSession, chunks: &mut Chunks, at: Cell) -> String {
+    if chunks.clip.is_empty() {
+        return "no chunks have been copied".to_string();
+    }
+    let (clip, parts, level) = (chunks.clip.clone(), chunks.parts, chunks.level);
+    let footprint: BTreeSet<Cell> = clip.footprint(at).map(|(cell, _)| cell).collect();
+    // The paste and its stitch are one entry, so one undo takes both back.
+    session
+        .history
+        .begin(format!("Paste {} chunks", clip.chunks.len()));
+    let written = paste_in(session, &clip, at, parts, level);
+    let stitched = match chunks.stitch_pasted && parts.heights && !written.is_empty() {
+        true => stitch_in(session, &footprint, chunks.stitch),
+        false => 0,
+    };
+    session.history.end();
+    let said = match stitched {
+        0 => format!("pasted onto {} of {} chunks", written.len(), clip.chunks.len()),
+        n => format!(
+            "pasted onto {} of {} chunks; the stitch changed {n} chunks",
+            written.len(),
+            clip.chunks.len()
+        ),
+    };
+    // What was asked for is selected, so the outline shows where the paste
+    // went even where it changed nothing.
+    chunks.select(footprint);
+    chunks.primary = Some(at);
+    said
+}
+
 /// [`paste`], recorded in whatever history entry is open.
 fn paste_in(
     session: &mut EditSession,
@@ -1542,6 +1586,11 @@ fn paste_in(
             }
         }
     }
+    // Locked vertices are put back before the shading is worked out, as in
+    // `stitch_in`.
+    for (coord, list) in edits.iter_mut() {
+        session.hold_locked(*coord, list);
+    }
     reshade_across(session, &moved, &mut edits);
     commit(session, edits, true);
     written
@@ -1659,7 +1708,7 @@ fn press(
     }
     if keys.just_pressed(KeyCode::Escape) && !chunks.selected.is_empty() {
         chunks.clear();
-        session.bypass_change_detection().status = "chunk selection dropped".to_string();
+        session.bypass_change_detection().status = "chunk selection cleared".to_string();
     }
     let control = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     if control && keys.just_pressed(KeyCode::KeyA) {
@@ -1684,34 +1733,7 @@ fn press(
         let status = match (chunks.clip.is_empty(), chunks.at) {
             (true, _) => "no chunks have been copied".to_string(),
             (false, None) => "no chunk under the pointer to paste onto".to_string(),
-            (false, Some(at)) => {
-                let (clip, parts, level) = (chunks.clip.clone(), chunks.parts, chunks.level);
-                let footprint: BTreeSet<Cell> = clip.footprint(at).map(|(cell, _)| cell).collect();
-                // The paste and its stitch are one entry, so one undo takes
-                // both back.
-                session
-                    .history
-                    .begin(format!("Paste {} chunks", clip.chunks.len()));
-                let written = paste_in(session, &clip, at, parts, level);
-                let stitched = match chunks.stitch_pasted && parts.heights && !written.is_empty() {
-                    true => stitch_in(session, &footprint, chunks.stitch),
-                    false => 0,
-                };
-                session.history.end();
-                let said = match stitched {
-                    0 => format!("pasted onto {} of {} chunks", written.len(), clip.chunks.len()),
-                    n => format!(
-                        "pasted onto {} of {} chunks, {n} moved by the stitch",
-                        written.len(),
-                        clip.chunks.len()
-                    ),
-                };
-                // What was asked for is selected, so the outline shows where
-                // the paste went even where it changed nothing.
-                chunks.select(footprint);
-                chunks.primary = Some(at);
-                said
-            }
+            (false, Some(at)) => paste_at(session, &mut chunks, at),
         };
         session.bypass_change_detection().status = status;
     }
@@ -1779,7 +1801,7 @@ const INSET: f32 = 0.05;
 /// Only the sides a set shares with a chunk outside it are drawn, so a block
 /// is one outline and not a lattice.
 fn draw(
-    mut gizmos: Gizmos<crate::tools::gizmo::EditorHandles>,
+    mut marks: ResMut<crate::marks::Marks>,
     chunks: Res<Chunks>,
     session: Option<Res<EditSession>>,
     tool: Res<Tool>,
@@ -1795,9 +1817,9 @@ fn draw(
     let pasting = Color::srgb(0.45, 0.90, 0.55);
     let hovered = Color::srgba(1.0, 1.0, 1.0, 0.7);
 
-    outline(&mut gizmos, &session, &chunks.selected, selected);
+    outline(&mut marks, &session, &chunks.selected, selected);
     let swept: BTreeSet<Cell> = chunks.sweeping().iter().copied().collect();
-    outline(&mut gizmos, &session, &swept, sweeping);
+    outline(&mut marks, &session, &swept, sweeping);
     let Some(at) = chunks.at.filter(|_| swept.is_empty()) else {
         return;
     };
@@ -1807,9 +1829,9 @@ fn draw(
     match control && !chunks.clip.is_empty() {
         true => {
             let footprint: BTreeSet<Cell> = chunks.clip.footprint(at).map(|(cell, _)| cell).collect();
-            outline(&mut gizmos, &session, &footprint, pasting);
+            outline(&mut marks, &session, &footprint, pasting);
         }
-        false => outline(&mut gizmos, &session, &BTreeSet::from([at]), hovered),
+        false => outline(&mut marks, &session, &BTreeSet::from([at]), hovered),
     }
 }
 
@@ -1828,7 +1850,7 @@ fn border(cells: &BTreeSet<Cell>) -> Vec<(Cell, Side)> {
 
 /// Draw the border of `cells` on the ground.
 fn outline(
-    gizmos: &mut Gizmos<crate::tools::gizmo::EditorHandles>,
+    marks: &mut crate::marks::Marks,
     session: &EditSession,
     cells: &BTreeSet<Cell>,
     colour: Color,
@@ -1868,7 +1890,7 @@ fn outline(
         for step in 1..=steps {
             let k = step as f32 / steps as f32;
             let next = at(from.0 + (to.0 - from.0) * k, from.1 + (to.1 - from.1) * k);
-            gizmos.line(last, next, colour);
+            marks.ground_line(last, next, colour, crate::marks::Look::Ghosted);
             last = next;
         }
     }

@@ -1,15 +1,13 @@
 # Vale
 
 Vale is a from-scratch game client and world editor for the 1.12.1 (build 5875)
-protocol, written in Rust. It connects to a
-[vmangos](https://github.com/vmangos/core) server. The server does all gameplay
-simulation: combat resolution, quests, pathing, spell effects and spawns. Vale
-implements the client half: the network protocol, parsers for the game's data
-files, a renderer, and a runtime for the game's own interface code.
+protocol, written in Rust. The server does all gameplay simulation: combat
+resolution, quests, pathing, spell effects and spawns. Vale implements the
+client half: the network protocol, parsers for the game's data files, a
+renderer, and a runtime for the game's own interface code.
 
 The repository contains source code only. It contains no game data. To run it
-you need a copy of the 1.12.1 client data that you supply, and a server that you
-run yourself. See [Legal](#legal).
+you need a copy of the 1.12.1 client data that you supply. See [Legal](#legal).
 
 The workspace builds three programs:
 
@@ -23,10 +21,10 @@ The workspace builds three programs:
 
 ### Client
 
-- **Network.** SRP6 logon against realmd, the encrypted world session, and a
-  single packet dispatch into an object manager. Movement packets are shaped
-  to pass the server's movement validation, and other units are dead-reckoned
-  the way the server extrapolates them.
+- **Network.** SRP6 logon, the encrypted world session, and a single packet
+  dispatch into an object manager. Movement packets are shaped to pass the
+  server's movement validation, and other units are dead-reckoned the way the
+  server extrapolates them.
 - **World.** Terrain streamed around the character, with texture layers, baked
   shadows and per-map, per-hour lighting, fog, sky, stars, sun and moons.
   Water outside and inside buildings, with an underwater view. Placed models
@@ -68,26 +66,40 @@ The workspace builds three programs:
 Vale IDE builds the same app as the client and adds editing on top of it, so
 the world it shows is drawn by the client's own renderer.
 
-- **Terrain.** Height brushes (raise, lower, flatten, smooth), ramps between
-  two points, texture painting with blend maps, vertex colour, holes, area ids
-  per chunk, and water. Whole chunks can be selected, copied, pasted, and
-  stitched to the ground around them.
+- **Terrain.** Height brushes (raise, lower, flatten, smooth, noise),
+  flattening onto a sloped plane, a vertex selection that can be levelled,
+  smoothed and tilted, and locked vertices that no height operation moves.
+  Ramps between two points, and roads along a curve of points that grade the
+  ground and paint a surface and a verge texture. Texture painting with blend
+  maps, vertex colour, holes, area ids per chunk, and flat or sloped water.
+  Whole chunks can be selected, copied, pasted, turned, mirrored and stitched
+  to the ground around them.
 - **Placement.** Placing, moving, rotating, scaling and removing models and
   buildings, with group selection, a model picker with previews and
-  favourites, and moves across tile borders.
-- **Map.** A map window for selecting, creating, copying and pasting tiles, and
-  a find-and-replace over every tile of a map for texture and model paths.
+  favourites, randomised placement, locked placements, and moves across tile
+  borders.
+- **Map.** A map window for selecting, creating, copying and pasting tiles,
+  rebaking shadows, redrawing minimaps, and exporting and importing heights
+  and blends as images. New maps, and a properties dialog for a map's client
+  row, its server row, and whether it is terrain or a single WMO. A top-down
+  map view, and a find-and-replace over every tile of a map for texture and
+  model paths.
+- **World data.** Lights, flight paths and their flight map, area triggers
+  with their server actions, and graveyards with the zones they serve, each
+  picked and dragged in the world.
 - **Client tables.** A table editor that opens every data table the client
-  ships, with named fields for spells and their visuals, the skill tables and
-  item sets. A spell's skill lines and teaching spells are edited on the
-  spell's own form. Spell visuals, kits and effects are previewed where they
-  are edited and where they are chosen, and an attachment lab positions
+  ships, with named fields for spells and their visuals, the skill tables,
+  item sets and zones. A spell's skill lines and teaching spells are edited on
+  the spell's own form. Spell visuals, kits and effects are previewed where
+  they are edited and where they are chosen, and an attachment lab positions
   effect models on a character.
 - **Server content.** Editors for the server's world database: creature and
   game object spawns and templates, items, quests with their giver and taker
   relations, loot tables, vendor and trainer lists, creature AI events, spell
-  lists and scripts with their texts, creature waypoint paths, and flight
-  paths. Model pickers show every display id as a picture.
+  lists and scripts with their texts, gossip menus, conditions, and creature
+  waypoint paths. Model pickers show every display id as a picture.
+- **Right-click menus.** A right click in the world opens a menu of the
+  current tool's one-click operations for what was clicked.
 - **Server data.** The server's navmesh drawn over the ground, and
   regeneration of the server's map, vmap and mmap tiles for changed terrain.
 - **Projects.** Edits are kept per project with undo. Applying writes rows to
@@ -121,17 +133,9 @@ Requirements:
 
 - [Rust](https://rustup.rs/)
 - the 1.12.1 client data
-- a [vmangos](https://github.com/vmangos/core) server (realmd and mangosd)
 
-The repository root works as a client install folder:
-
-1. Put the client data archives in `Data/`, or set `VALE_GAMEDATA` to another
-   location.
-2. Name the server in `realmlist.wtf`, in the repository root or in `WTF/`:
-
-   ```
-   set realmlist 127.0.0.1
-   ```
+The repository root works as a client install folder: put the client data
+archives in `Data/`, or set `VALE_GAMEDATA` to another location.
 
 ### Editor server settings
 
@@ -198,7 +202,7 @@ crates/protocol/   the network client: logon, world session, object manager,
 crates/assets/     the data file parsers: archives, terrain, models, buildings,
                    textures, data tables, the interface markup, and the game
                    rules they encode
-crates/config/     the install folder: realmlist.wtf, WTF/Config.wtf, Data/
+crates/config/     the install folder: WTF/Config.wtf, Data/
 crates/api/        the interface API the client implements, as data
 crates/cli/        `vale`, the command-line tool
 crates/client/     `vale-client`, the Bevy renderer: render/ world/ game/ lua/
@@ -233,15 +237,14 @@ be made to contain:
 - any proprietary source code, or any part of the client binary
 - any account, realm or server data
 
-To run Vale you must supply your own copy of client data and your own
-server. The data is read at run time from a directory you choose; nothing is
-copied into this repository or redistributed by it.
+To run Vale you must supply your own copy of client data. The data is read at
+run time from a directory you choose; nothing is copied into this repository or
+redistributed by it.
 
-Vale connects only to a server that its operator runs. It has no code path to
-any official or retail service, and it does not circumvent any technical
-protection measure, digital rights management or subscription check. It
-implements the 1.12.1 logon handshake (SRP6) as the open-source vmangos server
-implements it, in order to authenticate against that server.
+Vale has no code path to any official or retail service, and it does not
+circumvent any technical protection measure, digital rights management or
+subscription check. It implements the 1.12.1 logon handshake (SRP6) as the
+open-source vmangos server implements it.
 
 The project exists for interoperability research, file-format documentation
 and preservation of an old network protocol and file format family. You are

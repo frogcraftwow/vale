@@ -386,7 +386,7 @@ impl Services {
             + other_rows.iter().filter(|s| s.life != Life::Delete && !s.forbidden).count();
         if !list.is_template() && other_rows.iter().any(|s| s.life != Life::Delete && s.ware.item == item) {
             return Err(format!(
-                "item {item} is already in the template list {} {}, and the server skips it in the \
+                "item {item} is already in the template list {} {}, so the server would skip it in the \
                  creature's own list",
                 vendor::TEMPLATE,
                 other.map_or(0, |o| o.entry)
@@ -408,7 +408,7 @@ impl Services {
         };
         if shown.iter().any(|s| s.ware.item == item && s.in_database.is_some()) {
             session.set_server_row(list.table, &key, None, Some(gesture));
-            return Ok(format!("kept item {item} in {} {}", list.table, list.entry));
+            return Ok(format!("cancelled removal of item {item} in {} {}", list.table, list.entry));
         }
         let slot = kept.iter().map(|s| s.ware.slot).max().unwrap_or(0) + 1;
         let ware = Ware::new(list.entry, item, slot);
@@ -444,7 +444,7 @@ impl Services {
                 .any(|s| s.life != Life::Delete && s.lesson.spell == spell);
             if taught_there {
                 return Err(format!(
-                    "spell {spell} is already in the template list {} {}, and the server skips it \
+                    "spell {spell} is already in the template list {} {}, so the server would skip it \
                      in the creature's own list",
                     trainer::TEMPLATE,
                     other.entry
@@ -461,7 +461,7 @@ impl Services {
         };
         if shown.iter().any(|s| s.lesson.key() == key && s.in_database.is_some()) {
             session.set_server_row(list.table, &key, None, Some(gesture));
-            return Ok(format!("kept spell {spell} in {} {}", list.table, list.entry));
+            return Ok(format!("cancelled removal of spell {spell} in {} {}", list.table, list.entry));
         }
         session.set_server_row(list.table, &key, Some(&creation(&lesson.assignments())), Some(gesture));
         Ok(format!("spell {spell} added to {} {}", list.table, list.entry))
@@ -572,7 +572,7 @@ impl Services {
 }
 
 /// A created row's claim: every column it is written with.
-fn creation(changes: &[Assignment]) -> RowEdit {
+pub(crate) fn creation(changes: &[Assignment]) -> RowEdit {
     let mut row = RowEdit {
         life: Life::Insert,
         ..RowEdit::default()
@@ -584,7 +584,13 @@ fn creation(changes: &[Assignment]) -> RowEdit {
 }
 
 /// One column written under a gesture; see [`Services::set_column`].
-fn write_column(
+///
+/// A row the project creates is written into its creation even when the
+/// database also holds a row under that key, which it does after the creation
+/// has been applied. Clearing a column of a creation because it matches the
+/// database's left the creation without that column once the database's row
+/// was put back, and the plan then refused the whole row.
+pub(crate) fn write_column(
     session: &mut EditSession,
     table: &'static str,
     key: &Key,
@@ -593,7 +599,8 @@ fn write_column(
     value: String,
     gesture: Gesture<'_>,
 ) {
-    match held {
+    let creating = session.server_edits.row(table, key).is_some_and(|row| row.life == Life::Insert);
+    match held.filter(|_| !creating) {
         Some(held) => {
             let had = held.iter().find(|change| change.column == column).map(|change| &change.value);
             let value = match had == Some(&value) {

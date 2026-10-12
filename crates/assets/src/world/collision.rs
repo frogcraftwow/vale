@@ -691,6 +691,16 @@ pub struct CollisionWorld {
     inner: RwLock<Inner>,
 }
 
+/// Tiles [`CollisionWorld::retain_tiles`] took out, for the caller to drop
+/// wherever freeing them costs nothing that matters.
+pub struct Retired(Vec<Tile>);
+
+impl Retired {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     /// Which map these colliders belong to. A far teleport invalidates every
@@ -1351,15 +1361,28 @@ impl CollisionWorld {
 
     /// Forget every tile not in `live`. Called with the tiles the renderer
     /// still has, so a building goes when the ground it stands on does.
-    pub fn retain_tiles(&self, live: &HashSet<(u32, u32)>) {
+    ///
+    /// The forgotten tiles are returned rather than dropped here. A tile's
+    /// hulls are every triangle of its buildings and doodads, and freeing a
+    /// block of them took up to 19 ms on the caller's thread, which is the main
+    /// thread; the caller drops [`Retired`] on a background task instead. The
+    /// write lock is held only to move them out.
+    pub fn retain_tiles(&self, live: &HashSet<(u32, u32)>) -> Retired {
         // Checked under a read lock first, because the caller is a Bevy system
         // running every frame and the steady state is "nothing has changed" —
         // taking the write lock sixty times a second would block the session
         // thread's floor query for no reason at all.
         if self.read().tiles.keys().all(|k| live.contains(k)) {
-            return;
+            return Retired(Vec::new());
         }
-        self.write().tiles.retain(|coord, _| live.contains(coord));
+        let mut inner = self.write();
+        let gone: Vec<(u32, u32)> = inner
+            .tiles
+            .keys()
+            .copied()
+            .filter(|coord| !live.contains(coord))
+            .collect();
+        Retired(gone.into_iter().filter_map(|coord| inner.tiles.remove(&coord)).collect())
     }
 
     pub fn clear(&self) {
@@ -2598,6 +2621,39 @@ mod tests {
         let world = world_with(&wall());
         let end = world.step(0, [4.9, 5.0, 0.0], [1.0, 5.0, 0.0]);
         assert!((end[0] - 1.0).abs() < 1.0e-3, "x stopped at {}", end[0]);
+    }
+
+    /// **A run along a wall at a shallow angle never crosses it**, at any
+    /// stride length the mover produces and at a whole 250 ms mounted stride.
+    ///
+    /// Each stride is swept along its whole length and half a yard beyond, so
+    /// the wall is met before the stride reaches it however long the stride is
+    /// and however shallow the angle. The strides are the session's run and
+    /// mounted ticks (0.175 and 0.35 yards), the mover's longest piece (0.5),
+    /// and an unbroken mounted stall (3.5).
+    #[test]
+    fn a_run_along_a_wall_at_a_shallow_angle_never_crosses_it() {
+        let world = world_with(&wall());
+        for stride in [0.175_f32, 0.35, 0.5, 3.5] {
+            for degrees in [2.0_f32, 5.0, 10.0, 20.0, 45.0] {
+                let angle = degrees.to_radians();
+                let (dx, dy) = (angle.sin() * stride, angle.cos() * stride);
+                let mut at = [3.5_f32, 0.5, 0.0];
+                while at[1] < 9.0 {
+                    let end = world.step(0, at, [at[0] + dx, at[1] + dy, at[2]]);
+                    assert!(
+                        end[0] < 5.0,
+                        "{stride}-yard strides at {degrees} degrees reached x = {} through the \
+                         wall at x = 5",
+                        end[0],
+                    );
+                    if end == at {
+                        break;
+                    }
+                    at = end;
+                }
+            }
+        }
     }
 
     /// The reason the probes start above [`STEP_UP`]: a stair riser is a wall,

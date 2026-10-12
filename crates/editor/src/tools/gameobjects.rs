@@ -38,6 +38,7 @@
 use super::creatures::TemplateSubject;
 use super::Tool;
 use crate::server::fresh::Fresh;
+use crate::marks::{Look, Marks};
 use crate::session::EditSession;
 use vale_client::render::focus::WorldFocus;
 use vale_client::world::camera::WorldCamera;
@@ -540,6 +541,9 @@ pub struct GameObjects {
     /// …and the same for [`Self::spawn_row`].
     spawn_at: Option<(u64, bool)>,
     pub show_models: bool,
+    /// Mark every near spawn, or only the selected, hovered and grouped ones.
+    /// See `super::creatures::Creatures::show_markers`.
+    pub show_markers: bool,
     pub model_budget: usize,
     /// How far out a spawn is drawn at all, in yards.
     pub range: f32,
@@ -587,6 +591,7 @@ impl Default for GameObjects {
             spawn_task: None,
             spawn_at: None,
             show_models: true,
+            show_markers: true,
             // A game object is a static model with no skeleton to pose and no
             // dressing to compose, so the budget is twice the creature tool's.
             model_budget: 400,
@@ -1127,7 +1132,7 @@ impl GameObjects {
             gameobject::SPAWN,
             &key,
             wanted.as_ref(),
-            Some(crate::session::Gesture { label: "Keep game object", subject: &subject, now }),
+            Some(crate::session::Gesture { label: "Cancel game object removal", subject: &subject, now }),
         );
     }
 
@@ -1235,12 +1240,12 @@ pub fn plan_template_move(
     }
     if to > gameobject::MAX_ENTRY {
         return Err(format!(
-            "{to} is past {}, which is all `entry` can hold",
+            "{to} is above {}, the largest value `entry` can hold",
             gameobject::MAX_ENTRY
         ));
     }
     if taken && to != subject.read_entry {
-        return Err(format!("entry {to} is already a game object"));
+        return Err(format!("gameobject_template entry {to} already exists"));
     }
     Ok(Some((subject.key(), gameobject::template_key(to, subject.patch))))
 }
@@ -1305,6 +1310,14 @@ const HANDLE_PIXELS: f32 = 16.0;
 
 /// How far from the original a duplicate lands, in yards.
 const APART: f32 = 2.0;
+
+/// Half the side of the box drawn over a spawn with no model, in yards. See
+/// `super::creatures::DOME_RADIUS`.
+const BOX_RADIUS: f32 = 0.5;
+
+/// The smallest box drawn around a spawn's model, in yards across: a vein or
+/// a chest is about this size.
+const BOX_AROUND_MODEL: f32 = 0.8;
 
 /// How far up from the row's position the marker reaches, in yards. Half the
 /// creature tool's: a vein or a chest is knee high.
@@ -1713,7 +1726,7 @@ fn place_one(
     // The surface is used rather than the ground, so a chest clicked onto a
     // dock or a brazier onto a balcony stands on it. See [`crate::pick`].
     let Some(ground) = cursor.surface else {
-        session.status = "nothing under the pointer — nothing placed".into();
+        session.status = "no surface under the pointer; nothing placed".into();
         return;
     };
     let facing = objects.ghost_facing.unwrap_or_else(|| match camera.single() {
@@ -1968,26 +1981,36 @@ fn move_one(session: &mut EditSession, guid: u64, to: Vec3, now: f64) {
     }
 }
 
-/// Draw a marker for every near spawn, and the selected one's facing.
+/// Draw a box on every near spawn, and the selected one's facing.
+///
+/// A box rather than the creature tool's dome, so the two server tools' marks
+/// differ by shape as well as by colour. A spawn drawn as a model gets a
+/// translucent box around its base; one with no model a smaller, near-opaque
+/// one. What is aimed at is [`Look::Ghosted`] and the rest [`Look::Solid`], for
+/// the reason `super::creatures::draw` gives.
 fn draw(
-    mut handles: Gizmos<super::gizmo::EditorHandles>,
-    mut marks: Gizmos<super::gizmo::WorldMarks>,
+    mut marks: ResMut<Marks>,
     objects: Res<GameObjects>,
     session: Option<Res<EditSession>>,
     tool: Res<Tool>,
     state: Res<crate::playtest::Playtest>,
-    camera: Query<&GlobalTransform, With<WorldCamera>>,
 ) {
     if !state.editing() || *tool != Tool::GameObjects {
         return;
     }
-    let Ok(camera) = camera.single() else { return };
-    let eye = Vec3::from(vale_client::render::axes::to_wow(camera.translation()));
     let edits = session.as_ref().map(|session| &session.server_edits);
     // Sorted once and searched per marker. See `super::doodads::draw_marker`.
     let members = super::group::sorted(objects.also.iter().copied());
     for (rank, index) in objects.near.iter().enumerate() {
         let Some(base) = objects.base_spawn(*index) else { continue };
+        // With the markers off, only what is aimed at. See
+        // [`GameObjects::show_markers`].
+        let wanted = objects.selected == Some(base.guid)
+            || objects.hovered == Some(base.guid)
+            || super::group::holds(&members, base.guid);
+        if !objects.show_markers && !wanted {
+            continue;
+        }
         let with_edits = edits.and_then(|edits| base.with_edits(edits));
         let spawn = with_edits.as_ref().unwrap_or(base);
         let chosen = objects.selected == Some(spawn.guid);
@@ -2008,29 +2031,22 @@ fn draw(
         };
         let aimed = chosen || member || under;
         let at = vale_client::render::axes::to_bevy(spawn.at.to_array());
-        let radius = (spawn.at.distance(eye) * 0.010).clamp(0.25, 3.0);
-        // A square rather than the creature tool's ring, so the two server
-        // tools' marks differ by shape as well as by colour.
-        let corner = |dx: f32, dy: f32| {
-            vale_client::render::axes::to_bevy(
-                (spawn.at + Vec3::new(dx * radius, dy * radius, 0.0)).to_array(),
-            )
+        let radius = marks.visible_radius(at, BOX_RADIUS);
+        let look = match aimed {
+            true => Look::Ghosted,
+            false => Look::Solid,
         };
-        let corners = [corner(1.0, 1.0), corner(1.0, -1.0), corner(-1.0, -1.0), corner(-1.0, 1.0)];
-        let top = vale_client::render::axes::to_bevy((spawn.at + Vec3::Z * BODY).to_array());
-        for side in 0..4 {
-            let (from, to) = (corners[side], corners[(side + 1) % 4]);
-            match aimed {
-                true => handles.line(from, to, colour),
-                false => marks.line(from, to, colour),
-            }
-        }
-        if !has_model {
-            match aimed {
-                true => handles.line(at, top, colour),
-                false => marks.line(at, top, colour),
-            }
-        }
+        let (side, colour) = match has_model {
+            true => (radius.max(BOX_AROUND_MODEL) * 2.0, colour.with_alpha(0.4)),
+            false => (radius * 2.0, colour.with_alpha(0.85)),
+        };
+        // Turned to the spawn's facing and standing on its position.
+        let pose = Transform {
+            translation: at + Vec3::Y * (side * 0.5),
+            rotation: Quat::from_rotation_y(spawn.orientation),
+            scale: Vec3::splat(side),
+        };
+        marks.cuboid(pose, colour, look);
         if spawn.is_removed() {
             let arm = radius * 1.4;
             for (dx, dy) in [(1.0, 1.0), (1.0, -1.0)] {
@@ -2040,17 +2056,19 @@ fn draw(
                 let to = vale_client::render::axes::to_bevy(
                     (spawn.at - Vec3::new(arm * dx, arm * dy, -BODY / 2.0)).to_array(),
                 );
-                handles.line(from, to, REMOVED);
+                marks.wide_line(from, to, 1.6, REMOVED, Look::Ghosted);
             }
         }
         if chosen {
-            // A line showing which way it faces, since a value such as 4.71
+            // An arrow showing which way it faces, since a value such as 4.71
             // radians is hard to read as a direction.
             let facing = Vec3::new(spawn.orientation.cos(), spawn.orientation.sin(), 0.0);
+            let from = vale_client::render::axes::to_bevy((spawn.at + Vec3::Z * 0.2).to_array());
             let nose = vale_client::render::axes::to_bevy(
                 (spawn.at + facing * (radius * 3.0) + Vec3::Z * 0.2).to_array(),
             );
-            handles.line(at, nose, Color::srgb(1.0, 0.95, 0.6));
+            let thickness = marks.line_radius(from) * 1.6;
+            marks.arrow(from, nose, thickness, Color::srgb(1.0, 0.95, 0.6), Look::Ghosted);
         }
     }
 }
@@ -2162,7 +2180,7 @@ pub struct Ghost {
 fn ghost(
     mut commands: Commands,
     mut objects: ResMut<GameObjects>,
-    mut handles: Gizmos<super::gizmo::EditorHandles>,
+    mut marks: ResMut<Marks>,
     cursor: Res<crate::pick::Cursor>,
     tool: Res<Tool>,
     state: Res<crate::playtest::Playtest>,
@@ -2216,12 +2234,9 @@ fn ghost(
     let nose = vale_client::render::axes::to_bevy(
         (at + Vec3::new(facing.cos(), facing.sin(), 0.0) * 1.5 + Vec3::Z * 0.2).to_array(),
     );
-    handles.line(centre, nose, NEW);
-    handles.circle(
-        Isometry3d::new(centre, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
-        0.6,
-        NEW,
-    );
+    let thickness = marks.line_radius(centre) * 1.6;
+    marks.arrow(centre, nose, thickness, NEW, Look::Ghosted);
+    marks.flat_ring(centre, 0.6, NEW, Look::Ghosted);
 
     let stand = Transform {
         translation: centre,

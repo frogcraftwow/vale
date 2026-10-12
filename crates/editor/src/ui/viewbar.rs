@@ -3,7 +3,7 @@
 //!
 //! ## Why the toggles are on a bar and not behind F4
 //!
-//! The eighteen layer subtractions, the seven diagnostic overlays and the three
+//! The twenty layer subtractions, the seven diagnostic overlays and the three
 //! frame settings that F5, F9 and F10 toggle are all on tabs of the client's
 //! debug window, where they are used during an investigation. In the editor
 //! they are used every few minutes to look at what is being edited: doodads
@@ -14,13 +14,14 @@
 //! A button draws the icon [`super::icons`] has under its switch label, and
 //! its short label from [`ART`] when there is none. No icons are shipped yet.
 //!
-//! ## The five groups
+//! ## The six groups
 //!
 //! ```text
 //! world    a subtraction: the layer is in the frame, and this takes it out
 //! overlay  an addition: not in the frame at all, drawn on top of it
 //! server   the server's navmesh, which is the editor's own overlay
 //! ground   the guides drawn on the terrain: one button that opens a menu
+//! camera   the editor camera's top-down map view
 //! frame    how the frame is produced: the three settings F5, F9 and F10 toggle
 //! ```
 //!
@@ -53,10 +54,10 @@
 //!
 //! ## A lit button is one moved off its default
 //!
-//! Sixteen of the eighteen layer switches default to on, so lighting every on
-//! button would light sixteen and show nothing. The accent marks a button that
-//! is not in its default state, and the label's or icon's brightness shows on
-//! and off.
+//! Nineteen of the twenty layer switches default to on in the editor, so
+//! lighting every on button would light nineteen and show nothing. The accent
+//! marks a button that is not in its default state, and the label's or icon's
+//! brightness shows on and off.
 //! The status line prints the same state as command-line flags.
 //!
 //! The default is the editor's own, not the client's:
@@ -130,12 +131,14 @@ const PICTURE: f32 = 24.0;
 /// by. `short` is drawn when the switch has no icon.
 ///
 /// A label absent from this table is drawn from [`initials`].
-pub const ART: [(&str, &str); 28] = [
+pub const ART: [(&str, &str); 31] = [
     // --- the world, in the order the frame is built ---
     ("fog", "FOG"),
     ("sky dome", "SKY"),
     ("stars", "STR"),
     ("sun and moons", "SUN"),
+    ("clouds", "CLD"),
+    ("skyboxes", "SBX"),
     ("terrain", "TER"),
     ("water", "WTR"),
     ("specular", "SPC"),
@@ -158,6 +161,8 @@ pub const ART: [(&str, &str); 28] = [
     ("skinned bounds", "SKN"),
     ("collision", "COL"),
     ("unit facing", "FAC"),
+    // --- the editor camera's own view ---
+    ("map view", "MAP"),
     // --- and how the frame is made ---
     ("MSAA", "AA"),
     ("vsync", "VSY"),
@@ -180,6 +185,7 @@ pub fn names() -> Vec<&'static str> {
     #[cfg(feature = "diagnostics")]
     names.extend(OVERLAYS.iter().map(|(label, _, _)| *label));
     names.push("navmesh");
+    names.push("map view");
     names
 }
 
@@ -225,6 +231,12 @@ pub struct Bar<'a> {
     pub navmesh: &'a mut crate::navmesh::Navmesh,
     /// The ground guides. A copy, written back by the caller when it changed.
     pub guides: &'a mut crate::tools::guides::Guides,
+    /// Whether the top-down map view is on. A copy, written back by the caller
+    /// when it changed. See [`crate::camera::TopDown`].
+    pub map_view: &'a mut bool,
+    /// Whether the editor is editing. The map view is the editor camera's, so
+    /// it is unavailable during a playtest.
+    pub editing: bool,
     /// Whether the Areas tool is drawing its own wash, which takes the place
     /// of the texture count while it is. The menu says so.
     pub areas_shown: bool,
@@ -239,8 +251,8 @@ pub struct Bar<'a> {
 }
 
 pub fn draw(ui: &mut Ui, bar: &mut Bar) {
-    // Wrapped, not scrolled: twenty-nine buttons at 32 points with 3 between
-    // them are about 1,015 points before the rules and `reset`, which fits one
+    // Wrapped, not scrolled: thirty-two buttons at 32 points with 3 between
+    // them are about 1,120 points before the rules and `reset`, which fits one
     // row on a full-width window, and a narrow window still shows all of them
     // on two rows rather than clipping the last ones.
     ui.horizontal_wrapped(|ui| {
@@ -308,7 +320,7 @@ pub fn draw(ui: &mut Ui, bar: &mut Bar) {
             None => {
                 let mut text = format!(
                     "server overlay: the server's navmesh (DataDir\\mmaps) around the camera, \
-                     which is where vmangos paths creatures. It shows the tiles as last \
+                     which vmangos uses for creature pathing. It shows the tiles as last \
                      regenerated, not unsaved edits.\n{}",
                     crate::navmesh::Navmesh::legend()
                 );
@@ -327,6 +339,23 @@ pub fn draw(ui: &mut Ui, bar: &mut Bar) {
 
         rule(ui);
         guides_menu(ui, bar.guides, bar.areas_shown, bar.open_guides);
+
+        // The editor camera's top-down view. Its own group, because it changes
+        // how the world is looked at rather than what is drawn.
+        rule(ui);
+        let why = match bar.editing {
+            true => "camera: the world seen straight down with north at the top, as the \
+                     game's minimap shows it, through an orthographic projection. The wheel \
+                     zooms, a right-drag moves the map, and W, A, S and D move north, west, \
+                     south and east. Sky, fog and weather are off while it is on."
+                .to_string(),
+            false => "camera: unavailable during a playtest, which uses the game's camera."
+                .to_string(),
+        };
+        let on = *bar.map_view;
+        if toggle(ui, bar.icons, "map view", on, false, bar.editing, &why) {
+            *bar.map_view = !on;
+        }
 
         rule(ui);
         for (key, label, field) in FRAME {
@@ -353,6 +382,7 @@ pub fn draw(ui: &mut Ui, bar: &mut Bar) {
             *bar.frame = RenderTuning::default();
             bar.navmesh.on = false;
             *bar.guides = crate::tools::guides::Guides::default();
+            *bar.map_view = false;
             #[cfg(feature = "diagnostics")]
             {
                 *bar.overlay = editor_overlay(None);
@@ -433,8 +463,8 @@ fn guides_menu(
             })
             .response
             .on_hover_text(
-                "Shade the ground steeper than this, in degrees from level. vmangos builds \
-                 its navmesh with 50\u{b0}: steeper ground is ground no creature paths across.",
+                "Shade ground steeper than this angle, in degrees from level. vmangos builds \
+                 its navmesh with a 50\u{b0} limit: creatures do not path across steeper ground.",
             );
             ui.horizontal(|ui| {
                 ui.checkbox(&mut guides.contours, "Contours every");
@@ -448,14 +478,14 @@ fn guides_menu(
                 );
             })
             .response
-            .on_hover_text("A line at every multiple of this height.");
+            .on_hover_text("Draw a contour line at every multiple of this height.");
 
             ui.add_space(2.0);
             theme::heading(ui, "Textures");
             ui.checkbox(&mut guides.layers, "Full chunks").on_hover_text(
-                "Wash red the chunks that carry four textures. A chunk holds four at \
-                 most, and a brush stroke with a fifth is refused there. The texture \
-                 brush's panel has the same switch.",
+                "Shade red the chunks that have four texture layers. A chunk holds at \
+                 most four, so a brush stroke that adds a fifth texture is refused there. \
+                 The texture brush panel has the same checkbox.",
             );
             if guides.layers && areas_shown {
                 theme::note(ui, "not drawn while the Areas tool shows areas");
@@ -465,8 +495,8 @@ fn guides_menu(
         egui::Popup::open_id(ui.ctx(), egui::Popup::default_response_id(&response));
     }
     response.on_hover_text(
-        "ground guides: lines and shading drawn on the terrain to read it by. They edit \
-         nothing and are off during a playtest.",
+        "ground guides: lines and shading drawn on the terrain. They change no data and \
+         are hidden during a playtest.",
     );
 }
 
@@ -477,13 +507,13 @@ fn guides_menu(
 #[cfg(feature = "diagnostics")]
 fn collision_radius(ui: &mut Ui, overlay: &mut DebugOverlay, drawn: &CollisionDrawn) {
     let mut hover = format!(
-        "collision radius, in yards round the camera's target. {} hulls, {} triangles drawn.",
+        "collision radius, in yards around the camera's target. {} hulls, {} triangles drawn.",
         drawn.hulls, drawn.triangles
     );
     if drawn.capped {
         hover.push_str(&format!(
-            "\nCapped at {} triangles: the nearest hulls are drawn and the rest are not. \
-             Narrow the radius to see all of it.",
+            "\nCapped at {} triangles: only the nearest hulls are drawn. Reduce the radius \
+             to draw every hull in range.",
             overlay.collision_triangles
         ));
     }
@@ -597,20 +627,32 @@ fn toggle(
 ///
 /// The frame settings are not echoed: they are on function keys, and
 /// `--tune` spells them differently (`novsync`, `shadows`).
+///
+/// With the map view on, `--map-view` is echoed and the five switches it
+/// turns off are measured against a baseline that has them off, so they are
+/// not echoed again as `--without`.
 pub fn scripted(
     world: &WorldTuning,
     baseline: &WorldTuning,
     #[cfg(feature = "diagnostics")] overlay: &DebugOverlay,
     navmesh: bool,
+    map_view: bool,
     guides: &crate::tools::guides::Guides,
 ) -> Vec<String> {
+    let mut base = baseline.clone();
+    if map_view {
+        crate::camera::switch_off_for_map_view(&mut base);
+    }
     let (off, on) = lists(
         world,
-        baseline,
+        &base,
         #[cfg(feature = "diagnostics")]
         overlay,
     );
     let mut flags = Vec::new();
+    if map_view {
+        flags.push("--map-view".to_string());
+    }
     if !off.is_empty() {
         flags.push(format!("--without {off}"));
     }
@@ -716,6 +758,7 @@ mod tests {
                 #[cfg(feature = "diagnostics")]
                 &overlay,
                 navmesh,
+                false,
                 &crate::tools::guides::Guides::default(),
             )
         };
@@ -739,8 +782,30 @@ mod tests {
             #[cfg(feature = "diagnostics")]
             &overlay,
             false,
+            false,
             &guides,
         );
         assert_eq!(echoed, vec!["--guides chunks,slope"]);
+    }
+
+    /// The map view is echoed as its own flag, and the switches it turns off
+    /// are not echoed again as `--without`.
+    #[test]
+    fn the_map_view_is_echoed_once() {
+        let editing = crate::playtest::world_baseline(true);
+        let mut world = editing.clone();
+        crate::camera::switch_off_for_map_view(&mut world);
+        #[cfg(feature = "diagnostics")]
+        let overlay = editor_overlay(None);
+        let echoed = scripted(
+            &world,
+            &editing,
+            #[cfg(feature = "diagnostics")]
+            &overlay,
+            false,
+            true,
+            &crate::tools::guides::Guides::default(),
+        );
+        assert_eq!(echoed, vec!["--map-view"]);
     }
 }

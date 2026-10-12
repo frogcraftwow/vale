@@ -50,8 +50,17 @@
 //! charcreate.rs what a character may be made of
 //! area.rs       where the character is, in the game's own words
 //! channels.rs   the six chat channels everybody is in, and which of them where
+//! territory.rs  whose land the character stands on, which colours the zone
+//!               name on PvP realms
+//! defense.rs    which defense channels hear that a zone is under attack
+//! worldstate.rs which world states the frame above the minimap lists where,
+//!               and how a line's text names the values it shows
+//! servermessage.rs the sentence each SMSG_SERVER_MESSAGE type is shown as
 //! wmoarea.rs    where the character is when that is inside a building
 //! areatrigger.rs the 432 volumes a character is reported standing in
+//! safeloc.rs    WorldSafeLocs: the places a dead character's spirit appears
+//! map.rs        Map: the maps by id, the folder each one's files are in, and
+//!               what a new one's folder may be called
 //! taxi.rs       the flight map, which is all arithmetic
 //! worldmap.rs   which parchment the world map shows, plus <continent>.zmp
 //! areapoi.rs    the flags drawn on that parchment, gated on exploration
@@ -75,6 +84,7 @@ pub mod areatrigger;
 pub mod bank;
 pub mod book;
 pub mod channels;
+pub mod defense;
 pub mod charcreate;
 pub mod dbc;
 pub mod faction;
@@ -87,6 +97,7 @@ pub mod itemsound;
 pub mod light;
 pub mod loading;
 pub mod lock;
+pub mod map;
 pub mod minimap;
 pub mod questmark;
 pub mod questsort;
@@ -96,6 +107,8 @@ pub mod pagetext;
 pub mod repair;
 pub mod shiptransport;
 pub mod resistances;
+pub mod safeloc;
+pub mod servermessage;
 pub mod skills;
 pub mod sound;
 pub mod schema;
@@ -109,8 +122,10 @@ pub mod enchant;
 pub mod stationery;
 pub mod talent;
 pub mod taxi;
+pub mod territory;
 pub mod transport;
 pub mod tradeskill;
 pub mod trainer;
 pub mod wmoarea;
 pub mod worldmap;
+pub mod worldstate;

@@ -46,7 +46,7 @@ use crate::play::chat::{ChatType, Language};
 use crate::socket::handler::{apply_packet, Incoming, LocalState, PumpStats, Replies};
 use crate::play::wdb::{Caches, Kind};
 use crate::play::areatrigger::{TriggerTable, TriggerWatch};
-use crate::state::movement::{Controls, Footing, MovementInfo, Mover, Speeds};
+use crate::state::movement::{Controls, Footing, Input, MovementInfo, Mover, Speeds};
 use crate::state::objects::ObjectManager;
 use crate::opcodes::Opcode;
 use crate::state::query;
@@ -828,8 +828,12 @@ pub enum TaxiVerb {
 /// What a UI sends the session thread.
 #[derive(Debug, Clone)]
 pub enum Command {
-    /// Which movement keys are held now.
-    Controls(Controls),
+    /// Which movement keys are held from the given moment on.
+    ///
+    /// The moment is when the keys were read, so the session can apply the
+    /// change where the character was at that moment rather than at the start
+    /// of the tick that drains it; see [`Mover::advance_through`].
+    Controls(Controls, Instant),
     // Several variants below carry a nested verb enum; the reason is given at
     // [`Command::Loot`].
     /// Absolute facing in radians, from mouse-look rather than the turn keys.
@@ -846,7 +850,10 @@ pub enum Command {
     /// Leave the ground. This is an edge, not a held control: the server allows
     /// one `MSG_MOVE_JUMP` between landings and rejects the rest, so a held key
     /// must produce one command, not sixty.
-    Jump,
+    ///
+    /// Stamped with the moment of the press, for the reason
+    /// [`Command::Controls`] is.
+    Jump(Instant),
     /// Start swinging at a unit, or `None` to stop.
     Attack(Option<u64>),
     /// The selected unit, or `None` for no selection.
@@ -1090,6 +1097,26 @@ pub enum Command {
     SummonResponse { summoner: u64 },
     /// `/played`: `CMSG_PLAYED_TIME`, with no body.
     RequestPlayedTime,
+    /// `/roll`: `MSG_RANDOM_ROLL` with the range. See [`crate::play::randomroll`].
+    RandomRoll { min: u32, max: u32 },
+    /// A click on the minimap: `MSG_MINIMAP_PING` with the world position. See [`crate::play::minimap`].
+    MinimapPing { x: f32, y: f32 },
+    /// Place raid target icon `icon` (0..8) on `guid`, or clear it with guid 0: `MSG_RAID_TARGET_UPDATE`. See [`crate::play::raidtarget`].
+    RaidTargetSet { icon: u8, guid: u64 },
+    /// Ask for the group's raid target icons: `MSG_RAID_TARGET_UPDATE` with `0xFF`.
+    RaidTargetList,
+    /// Share a quest with the group: `CMSG_PUSHQUESTTOPARTY`. See [`crate::play::questshare`].
+    PushQuest { quest_id: u32 },
+    /// Take the party quest another member accepted: `CMSG_QUEST_CONFIRM_ACCEPT`.
+    QuestConfirmAccept { quest_id: u32 },
+    /// Answer a shared quest's page: `MSG_QUEST_PUSH_RESULT` to the sharer, which the client sends with `Declined` when the page is closed.
+    QuestPushResult { sharer: u64, result: crate::play::questshare::PushResult },
+    /// Mark tutorial `id` (1-based) as seen: `CMSG_TUTORIAL_FLAG`. See [`crate::play::tutorial`].
+    TutorialFlag { id: u32 },
+    /// Mark every tutorial as seen, turning the tips off: `CMSG_TUTORIAL_CLEAR`, with no body.
+    TutorialClear,
+    /// Mark no tutorial as seen, turning the tips on: `CMSG_TUTORIAL_RESET`, with no body.
+    TutorialReset,
     /// Flip `PLAYER_FLAGS_HIDE_HELM` (`helm`) or `PLAYER_FLAGS_HIDE_CLOAK`:
     /// `CMSG_TOGGLE_HELM` or `CMSG_TOGGLE_CLOAK`, with no body. The server
     /// toggles the bit (vmangos' `HandleShowingHelmOpcode`), so the caller
@@ -1578,8 +1605,10 @@ impl LiveSession {
         let _ = self.commands.send(command);
     }
 
+    /// The movement keys held from now on. The command is stamped with
+    /// this moment; see [`Command::Controls`].
     pub fn set_controls(&self, controls: Controls) {
-        self.send(Command::Controls(controls));
+        self.send(Command::Controls(controls, Instant::now()));
     }
 
     pub fn face(&self, orientation: f32) {
@@ -1593,7 +1622,7 @@ impl LiveSession {
     }
 
     pub fn jump(&self) {
-        self.send(Command::Jump);
+        self.send(Command::Jump(Instant::now()));
     }
 
     /// Attack a unit, or `None` to stop attacking.
@@ -1948,6 +1977,56 @@ impl LiveSession {
         self.send(Command::RequestPlayedTime);
     }
 
+    /// See [`Command::RandomRoll`].
+    pub fn random_roll(&self, min: u32, max: u32) {
+        self.send(Command::RandomRoll { min, max });
+    }
+
+    /// See [`Command::MinimapPing`].
+    pub fn minimap_ping(&self, x: f32, y: f32) {
+        self.send(Command::MinimapPing { x, y });
+    }
+
+    /// See [`Command::RaidTargetSet`].
+    pub fn raid_target_set(&self, icon: u8, guid: u64) {
+        self.send(Command::RaidTargetSet { icon, guid });
+    }
+
+    /// See [`Command::RaidTargetList`].
+    pub fn raid_target_list(&self) {
+        self.send(Command::RaidTargetList);
+    }
+
+    /// See [`Command::PushQuest`].
+    pub fn push_quest(&self, quest_id: u32) {
+        self.send(Command::PushQuest { quest_id });
+    }
+
+    /// See [`Command::QuestConfirmAccept`].
+    pub fn quest_confirm_accept(&self, quest_id: u32) {
+        self.send(Command::QuestConfirmAccept { quest_id });
+    }
+
+    /// See [`Command::QuestPushResult`].
+    pub fn quest_push_result(&self, sharer: u64, result: crate::play::questshare::PushResult) {
+        self.send(Command::QuestPushResult { sharer, result });
+    }
+
+    /// See [`Command::TutorialFlag`].
+    pub fn tutorial_flag(&self, id: u32) {
+        self.send(Command::TutorialFlag { id });
+    }
+
+    /// See [`Command::TutorialClear`].
+    pub fn tutorial_clear(&self) {
+        self.send(Command::TutorialClear);
+    }
+
+    /// See [`Command::TutorialReset`].
+    pub fn tutorial_reset(&self) {
+        self.send(Command::TutorialReset);
+    }
+
     /// Flip the hide-helm or hide-cloak flag; see [`Command::ToggleWorn`].
     pub fn toggle_worn(&self, helm: bool) {
         self.send(Command::ToggleWorn { helm });
@@ -2143,6 +2222,10 @@ struct SessionLoop {
     /// When the simulation was last advanced, so the next step can be the time
     /// that actually passed. See [`SessionLoop::step_ms`].
     last_advance: Instant,
+    /// Movement keys and jumps drained from the channel and not yet applied,
+    /// each with the moment it was given. [`SessionLoop::tick_movement`]
+    /// applies them part-way through the step, at those moments.
+    inputs: Vec<(Instant, Input)>,
     /// Simulated milliseconds, published as [`SessionStatus::world_ms`].
     world_ms: u64,
     /// The sub-millisecond remainder of the last step.
@@ -2263,6 +2346,7 @@ impl SessionLoop {
             local: LocalState::new(Mover::new(start, Speeds::default()), map_id),
             replies: Replies::default(),
             last_advance: now,
+            inputs: Vec::new(),
             world_ms: 0,
             stalls: 0,
             platform_jumps: 0,
@@ -2304,9 +2388,6 @@ impl SessionLoop {
         loop {
             let tick_start = Instant::now();
 
-            if matches!(self.drain_commands(), Flow::Stop) {
-                break;
-            }
             self.read_socket().map_err(|e| format!("world stream: {e}"))?;
             // The character has left the world, so nothing below may run. The
             // calls that follow write to the socket about a character that no
@@ -2315,6 +2396,16 @@ impl SessionLoop {
             // client sees `in_world` become false on the same tick.
             if self.left_world {
                 self.publish_status();
+                break;
+            }
+            // Drained after the socket and immediately before the step is
+            // timed, so every key change stamped before the step's end is in
+            // this step. Drained before `read_socket`, a change made while the
+            // socket was being read (up to `READ_SLICE`) fell into the next
+            // step and was applied at its start, later than the renderer's
+            // prediction applied it, which drew a snap back on the next
+            // reading.
+            if matches!(self.drain_commands(), Flow::Stop) {
                 break;
             }
             // Sampled here rather than at the top of the loop, so the step is
@@ -2430,14 +2521,22 @@ impl SessionLoop {
     fn drain_commands(&mut self) -> Flow {
         loop {
             match self.commands.try_recv() {
-                Ok(Command::Controls(controls)) => {
-                    // One packet per flag change, in order: the server rejects
-                    // a packet whose opcode does not match the flag it added.
-                    for event in self.local.mover.set_controls(controls) {
-                        self.local.mover.info.flags = event.flags;
-                        if self.send_movement(event.opcode).is_err() {
-                            return Flow::Stop;
-                        }
+                Ok(Command::Controls(controls, at)) => {
+                    // Queued rather than applied, so the change takes effect at
+                    // the moment it was read; see [`Self::tick_movement`]. The
+                    // renderer sends the keys every frame, so only a change is
+                    // queued.
+                    let held = self
+                        .inputs
+                        .iter()
+                        .rev()
+                        .find_map(|(_, input)| match input {
+                            Input::Controls(c) => Some(*c),
+                            Input::Jump => None,
+                        })
+                        .unwrap_or_else(|| self.local.mover.controls());
+                    if controls != held {
+                        self.inputs.push((at, Input::Controls(controls)));
                     }
                 }
                 Ok(Command::Face(orientation)) => {
@@ -2459,17 +2558,15 @@ impl SessionLoop {
                     // see [`Mover::pitch_flags`].
                     self.local.mover.set_pitch(pitch);
                 }
-                Ok(Command::Jump) => {
-                    // Sent immediately rather than with the next heartbeat: the
+                Ok(Command::Jump(at)) => {
+                    // Queued with the keys, in the order given, so a key
+                    // pressed in the same frame as the jump is held when the
+                    // jump takes its speed and heading. The packet is sent in
+                    // the same tick rather than with the next heartbeat: the
                     // server anchors the whole parabola at the first packet
                     // carrying `MOVEFLAG_JUMPING` (`MovementInfo::Read`), so a
                     // jump reported a tick late is placed a tick further along.
-                    
-                    if let Some(event) = self.local.mover.jump() {
-                        if self.send_movement(event.opcode).is_err() {
-                            return Flow::Stop;
-                        }
-                    }
+                    self.inputs.push((at, Input::Jump));
                 }
                 Ok(Command::Attack(guid)) => {
                     let sent = match guid {
@@ -2788,6 +2885,56 @@ impl SessionLoop {
                         return Flow::Stop;
                     }
                 }
+                Ok(Command::RandomRoll { min, max }) => {
+                    if self.session.random_roll(min, max).is_err() {
+                        return Flow::Stop;
+                    }
+                }
+                Ok(Command::MinimapPing { x, y }) => {
+                    if self.session.minimap_ping(x, y).is_err() {
+                        return Flow::Stop;
+                    }
+                }
+                Ok(Command::RaidTargetSet { icon, guid }) => {
+                    if self.session.raid_target_set(icon, guid).is_err() {
+                        return Flow::Stop;
+                    }
+                }
+                Ok(Command::RaidTargetList) => {
+                    if self.session.raid_target_list().is_err() {
+                        return Flow::Stop;
+                    }
+                }
+                Ok(Command::PushQuest { quest_id }) => {
+                    if self.session.push_quest(quest_id).is_err() {
+                        return Flow::Stop;
+                    }
+                }
+                Ok(Command::QuestConfirmAccept { quest_id }) => {
+                    if self.session.quest_confirm_accept(quest_id).is_err() {
+                        return Flow::Stop;
+                    }
+                }
+                Ok(Command::QuestPushResult { sharer, result }) => {
+                    if self.session.quest_push_result(sharer, result).is_err() {
+                        return Flow::Stop;
+                    }
+                }
+                Ok(Command::TutorialFlag { id }) => {
+                    if self.session.tutorial_flag(id).is_err() {
+                        return Flow::Stop;
+                    }
+                }
+                Ok(Command::TutorialClear) => {
+                    if self.session.tutorial_clear().is_err() {
+                        return Flow::Stop;
+                    }
+                }
+                Ok(Command::TutorialReset) => {
+                    if self.session.tutorial_reset().is_err() {
+                        return Flow::Stop;
+                    }
+                }
                 Ok(Command::ToggleWorn { helm }) => {
                     if self.session.toggle_worn(helm).is_err() {
                         return Flow::Stop;
@@ -2891,15 +3038,16 @@ impl SessionLoop {
 
     /// Hand one packet to the dispatch, then send whatever it queued.
     ///
-    /// All dispatch is in [`crate::socket::handler`]. This function previously
-    /// held a second dispatch: seven opcodes were intercepted here and returned
-    /// early, because the shared `apply_packet` took only an `ObjectManager`
-    /// and could neither answer the server nor move the local player. That
-    /// split was undocumented, `SMSG_PONG` was handled in both places,
-    /// `stats.packets` was counted by hand in each branch, and a speed change
-    /// for another unit was acknowledged and then dropped. Two tasks remain
-    /// here: publishing to the status, and detecting that a packet relocated
-    /// the player.
+    /// All dispatch is in [`crate::socket::handler`]. This function does two
+    /// things: it publishes to the status, and it detects that a packet
+    /// relocated the player.
+    ///
+    /// An earlier version held a second dispatch here. It intercepted seven
+    /// opcodes and returned early, because the shared `apply_packet` took only
+    /// an `ObjectManager` and could neither answer the server nor move the
+    /// local player. With two dispatches, `SMSG_PONG` was handled in both
+    /// places, `stats.packets` was counted by hand in each branch, and a speed
+    /// change for another unit was acknowledged and then dropped.
     ///
     /// The replies are sent after the world lock is released, the same rule
     /// `resolve_names` follows: a socket write under that lock makes every
@@ -3038,6 +3186,7 @@ impl SessionLoop {
         // not still held when it returns.
         if mover == 0 {
             self.local.mover.set_controls(Controls::default());
+            self.inputs.clear();
             return Ok(());
         }
         // Let the ground load ahead: the tile under the character and the
@@ -3138,7 +3287,30 @@ impl SessionLoop {
             adrift,
         });
         let bound = bound.as_ref().map(|b| b as &dyn Footing);
-        let owed = self.local.mover.advance(dt_ms as f32 / 1000.0, bound);
+        // Each queued input is applied at its own moment in the step: its
+        // distance from the step's start. The 1.12.1 client does the same, so
+        // a key released mid-step stops the character where it was released,
+        // and the renderer's prediction, which applies the key in the frame it
+        // was read, agrees with the next reading instead of being corrected by
+        // it.
+        //
+        // The step is the last `dt_ms` before `last_advance`. After a stall
+        // longer than `MAX_STEP` that is the end of the stall, which is also
+        // the part of a long frame the 1.12.1 client simulates: it drops the
+        // excess at the start and moves the character over the last 250 ms.
+        let step_from = self
+            .last_advance
+            .checked_sub(Duration::from_millis(u64::from(dt_ms)))
+            .unwrap_or(self.last_advance);
+        let inputs: Vec<(f32, Input)> = self
+            .inputs
+            .drain(..)
+            .map(|(at, input)| (at.saturating_duration_since(step_from).as_secs_f32(), input))
+            .collect();
+        let owed = self
+            .local
+            .mover
+            .advance_through(dt_ms as f32 / 1000.0, &inputs, bound);
 
         // Record where the stride left the passenger, in the platform's frame.
         //
@@ -3163,8 +3335,12 @@ impl SessionLoop {
         // Leaving the ground and landing are reported immediately; see
         // `Mover::advance`, and `CHEAT_TYPE_BAD_FALL_STOP` for the anticheat
         // result of a landing reported in an ordinary heartbeat.
-        if let Some(opcode) = owed {
-            self.send_movement(opcode)?;
+        // Key changes and jumps are reported the same way, each with the
+        // position at its own moment.
+        if !owed.is_empty() {
+            for owed in owed {
+                self.send_owed(owed)?;
+            }
             self.last_facing_sent = Instant::now();
             return Ok(());
         }
@@ -3554,6 +3730,19 @@ impl SessionLoop {
     fn send_movement(&mut self, opcode: Opcode) -> io::Result<()> {
         let info = self.movement_info();
         self.session.send_movement(opcode, &info)?;
+        self.local.mover.mark_sent();
+        self.last_movement_sent = Instant::now();
+        lock(&self.status).movement_sent += 1;
+        Ok(())
+    }
+
+    /// Send a packet the mover owed part-way through a step, with the block
+    /// from that moment. The clock is stamped now rather than taken from the
+    /// block, so `ctime` never decreases from one packet to the next.
+    fn send_owed(&mut self, owed: crate::state::movement::Owed) -> io::Result<()> {
+        let mut info = owed.info;
+        info.time = self.local.movement_info().time;
+        self.session.send_movement(owed.opcode, &info)?;
         self.local.mover.mark_sent();
         self.last_movement_sent = Instant::now();
         lock(&self.status).movement_sent += 1;

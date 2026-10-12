@@ -9,7 +9,7 @@
 //! windows follow the selection, as the loot window does; the shell writes
 //! [`crate::tools::services::About`] from the selection each frame.
 //!
-//! ## A row is drawn as the server reads it
+//! ## What a row shows
 //!
 //! A vendor row is its item, its place in the list, its stock (a limit and
 //! the seconds between restocks, both or neither), its two restock flags and
@@ -29,7 +29,7 @@
 //! trains, from `trainer_type`, `trainer_class`, `trainer_race` and
 //! `trainer_spell` (`vale_mangos::trainer::who_words`).
 //!
-//! ## Nothing here reaches the database
+//! ## Edits go to the project, not the database
 //!
 //! An edit goes into the project's store and onto the undo stack; a save
 //! writes `sql\services.sql`; Apply is on the bar's Server… with the other
@@ -56,14 +56,19 @@ const NAME: f32 = 210.0;
 /// How wide a small number is drawn: a slot, a count, a level, a condition.
 const NUMBER: f32 = 52.0;
 
-/// …a skill line's name and id, which holds `Leatherworking (165)`.
+/// How wide a skill line's name and id is drawn. It holds
+/// `Leatherworking (165)`.
 const SKILL: f32 = 150.0;
 
-/// …a duration, which holds `1h 30m`.
+/// How wide a duration is drawn. It holds `1h 30m`.
 const TIME: f32 = 70.0;
 
-/// …a price, which holds `12g 50s 3c`.
+/// How wide a price is drawn. It holds `12g 50s 3c`.
 const MONEY: f32 = 90.0;
+
+/// How wide the line saying what a condition tests is drawn. A longer line is
+/// cut to this width, and the whole line is on hover.
+const CONDITION: f32 = 130.0;
 
 /// How tall a cell is.
 const CELL: f32 = 18.0;
@@ -138,7 +143,7 @@ fn add_chosen(subject: &mut Subject<'_>, table: &'static str, entry: u32, id: u3
             let done = subject.services.add_spell(subject.session, list, other, spell, facts, now);
             match (done, replaced) {
                 (Ok(line), Some(chosen)) => Ok(format!(
-                    "{line}: spell {chosen} is not a teaching spell, and {spell} teaches it"
+                    "{line}: spell {chosen} is not a teaching spell; added its teaching spell {spell}"
                 )),
                 (done, _) => done,
             }
@@ -167,9 +172,11 @@ fn open_spell_tables(subject: &mut Subject<'_>) -> bool {
 
 /// One window.
 fn window(ctx: &egui::Context, subject: &mut Subject<'_>, about: &About, kind: Kind) -> Option<egui::Rect> {
-    let (word, id, pos) = match kind {
-        Kind::Vendor => ("vendor", "vendor-window", [320.0, 140.0]),
-        Kind::Trainer => ("trainer", "trainer-window", [340.0, 160.0]),
+    // A vendor row is wider than a trainer row by the width of its condition
+    // cell.
+    let (word, id, pos, width) = match kind {
+        Kind::Vendor => ("vendor", "vendor-window", [320.0, 140.0], 900.0),
+        Kind::Trainer => ("trainer", "trainer-window", [340.0, 160.0], 700.0),
     };
     let mut keep_open = true;
     let shown = egui::Window::new(format!("{} \u{2014} {word}", about.label))
@@ -179,7 +186,7 @@ fn window(ctx: &egui::Context, subject: &mut Subject<'_>, about: &About, kind: K
         .open(&mut keep_open)
         // Wide enough for every cell of a row, and tall enough for the head,
         // the tabs and about eight rows. A longer list scrolls.
-        .default_size([700.0, 460.0])
+        .default_size([width, 460.0])
         .default_pos(pos)
         .resizable(true)
         .frame(
@@ -192,7 +199,7 @@ fn window(ctx: &egui::Context, subject: &mut Subject<'_>, about: &About, kind: K
         .show(ctx, |ui| {
             ui.label(
                 egui::RichText::new(format!(
-                    "creature_template entry {}: every spawn of it {} these.",
+                    "creature_template entry {}: every spawn of this entry {} these.",
                     about.entry,
                     match kind {
                         Kind::Vendor => "sells",
@@ -230,19 +237,18 @@ fn flag_offer(ui: &mut egui::Ui, subject: &mut Subject<'_>, about: &About, kind:
     }
     let (bit, name) = kind.flag();
     let sentence = match kind {
-        Kind::Vendor => "npc_flags has no VENDOR bit, so the client offers no vendor window for it.",
+        Kind::Vendor => "npc_flags has no VENDOR bit, so the client offers no vendor window.",
         Kind::Trainer => {
-            "npc_flags has no TRAINER bit, so the client offers no training window for it and \
-             the server skips every row of its own list at load."
+            "npc_flags has no TRAINER bit, so the client offers no training window and the \
+             server skips every row of the creature's own list at load."
         }
     };
     ui.label(egui::RichText::new(sentence).small().color(theme::BAD));
     if ui
         .small_button(format!("Set {name}"))
         .on_hover_text(format!(
-            "Write npc_flags with {bit:#x} added into creature_template. It is a creature edit: \
-             it is applied from the Creatures block of the Server panel and needs the server \
-             restarted."
+            "Add {bit:#x} to npc_flags in creature_template. This is a creature edit: apply it \
+             from the Creatures block of the Server panel, then restart the server."
         ))
         .clicked()
     {
@@ -326,7 +332,7 @@ fn list_head(ui: &mut egui::Ui, subject: &mut Subject<'_>, about: &About, kind: 
             let others: Vec<&(u32, String)> = users.iter().filter(|(entry, _)| *entry != about.entry).collect();
             match others.len() {
                 0 => {
-                    theme::note(ui, "Only this creature names the list.");
+                    theme::note(ui, "Only this creature uses this list.");
                 }
                 n => {
                     let names: Vec<String> = others
@@ -340,8 +346,8 @@ fn list_head(ui: &mut egui::Ui, subject: &mut Subject<'_>, about: &About, kind: 
                     };
                     ui.label(
                         egui::RichText::new(format!(
-                            "{n} other creature(s) name this list, and an edit changes every one of \
-                             them: {}{more}.",
+                            "{n} other creature(s) use this list, and an edit changes all of them: \
+                             {}{more}.",
                             names.join(", ")
                         ))
                         .small()
@@ -365,8 +371,9 @@ fn body(ui: &mut egui::Ui, subject: &mut Subject<'_>, about: &About, kind: Kind,
         theme::waiting(ui, format!("reading {} {}\u{2026}", list.table, list.entry));
         return;
     }
-    // The foot in a bottom panel, so the scroll gets exactly what is left:
-    // see the loot window's `body`, which has the same layout.
+    // The add button sits in a bottom panel, so the scroll area gets exactly
+    // the height that is left. The loot window's `body` uses the same layout
+    // and says why.
     egui::Panel::bottom(match kind {
         Kind::Vendor => "vendor-foot",
         Kind::Trainer => "trainer-foot",
@@ -412,7 +419,7 @@ fn adders(ui: &mut egui::Ui, subject: &mut Subject<'_>, kind: Kind, list: List) 
             if ui
                 .small_button("+ item\u{2026}")
                 .on_hover_text(format!(
-                    "Add an item to {} {}, after every item it has, with no limit on its stock.",
+                    "Add an item to the end of {} {}, with no stock limit.",
                     list.table, list.entry
                 ))
                 .clicked()
@@ -430,8 +437,8 @@ fn adders(ui: &mut egui::Ui, subject: &mut Subject<'_>, kind: Kind, list: List) 
             if ui
                 .small_button("+ spell\u{2026}")
                 .on_hover_text(format!(
-                    "Add a spell to {} {}, free, at the spell's own level. Choosing the ability \
-                     itself adds the spell that teaches it.",
+                    "Add a spell to {} {} at no cost and at the spell's own level. Choosing an \
+                     ability adds the spell that teaches it.",
                     list.table, list.entry
                 ))
                 .clicked()
@@ -502,17 +509,17 @@ fn vendor_rows(ui: &mut egui::Ui, subject: &mut Subject<'_>, about: &About, own:
                     faults.push(format!("item {} is not in item_template", shown.ware.item));
                 }
                 if shown.forbidden {
-                    faults.push("forbidden_items leaves the item out at the server's patch".to_string());
+                    faults.push("forbidden_items excludes the item at the server's patch".to_string());
                 }
                 if list == own && in_template.contains(&shown.ware.item) {
                     faults.push(format!(
-                        "the template list {} {} sells it already, so the server skips it here",
+                        "the template list {} {} already sells this item, so the server skips this row",
                         vendor::TEMPLATE,
                         about.vendor_id
                     ));
                 }
                 if counted && place >= vendor::MAX_ITEMS {
-                    faults.push(format!("it is past the {}th item of the two lists", vendor::MAX_ITEMS - 1));
+                    faults.push(format!("the row is past the {}th item of the two lists", vendor::MAX_ITEMS - 1));
                 }
                 let at = movable.iter().position(|item| *item == shown.ware.item);
                 vendor_row(ui, subject, list, shown, &faults, at, movable.len());
@@ -568,14 +575,14 @@ fn vendor_row(
         let about_slot = format!("slot {}: the list is sent to the client in slot order.", ware.slot);
         if ui
             .add_enabled(up, egui::Button::new("up").small())
-            .on_hover_text(format!("Move it one place up. {about_slot}"))
+            .on_hover_text(format!("Move the row up one place. {about_slot}"))
             .clicked()
         {
             subject.services.move_ware(subject.session, list, ware.item, -1, now);
         }
         if ui
             .add_enabled(down, egui::Button::new("down").small())
-            .on_hover_text(format!("Move it one place down. {about_slot}"))
+            .on_hover_text(format!("Move the row down one place. {about_slot}"))
             .clicked()
         {
             subject.services.move_ware(subject.session, list, ware.item, 1, now);
@@ -598,8 +605,8 @@ fn vendor_row(
                     }),
             )
             .on_hover_text(
-                "maxcount: how many the vendor holds; any is no limit. A limit needs a restock \
-                 time, and the server skips the row until both are set.",
+                "maxcount: the vendor's stock of this item; any is no limit. A limit needs \
+                 incrtime, and the server skips the row until both are set.",
             );
         if limit.changed() && maxcount != ware.maxcount as i64 {
             write(subject, "maxcount", maxcount.to_string());
@@ -614,7 +621,7 @@ fn vendor_row(
                     .custom_formatter(|value, _| seconds_words(value as i64, 0)),
             )
             .on_hover_text(format!(
-                "incrtime: seconds before one more is restocked; {}. Set exactly when maxcount is.",
+                "incrtime: seconds between restocks of one item; {}. Set it if and only if maxcount is set.",
                 seconds_words(ware.incrtime as i64, 0)
             ));
         if restock.changed() && incrtime != ware.incrtime as i64 {
@@ -639,7 +646,8 @@ fn vendor_row(
                 write(subject, "itemflags", flags.to_string());
             }
         }
-        condition_cell(ui, ware.condition, |value| write(subject, "condition_id", value));
+        let column = format!("{} {} condition_id", list.table, key.text());
+        condition_cell(ui, &column, ware.condition, |value| write(subject, "condition_id", value));
         remove_or_keep(ui, subject, list.table, &key, shown.life, shown.in_database.is_some());
     });
 }
@@ -690,7 +698,7 @@ fn trainer_rows(ui: &mut egui::Ui, subject: &mut Subject<'_>, about: &About, own
         (a.2, a.0.lesson.skill_value, &a.3, a.0.lesson.spell).cmp(&(b.2, b.0.lesson.skill_value, &b.3, b.0.lesson.spell))
     });
     let count = drawn.iter().filter(|(shown, ..)| shown.life != Life::Delete).count();
-    theme::note(ui, format!("{count} spell(s), by the level and then the skill rank each needs."));
+    theme::note(ui, format!("{count} spell(s), sorted by required level, then required skill rank."));
     egui::ScrollArea::vertical()
         .max_height(ui.available_height().max(60.0))
         .auto_shrink([false, true])
@@ -710,7 +718,7 @@ fn trainer_rows(ui: &mut egui::Ui, subject: &mut Subject<'_>, about: &About, own
                 faults.extend(trainer::spell_faults(*facts, teacher));
                 if list == own && in_template.contains(&shown.lesson.spell) {
                     faults.push(format!(
-                        "the template list {} {} teaches it already, so the server skips it here",
+                        "the template list {} {} already teaches this spell, so the server skips this row",
                         trainer::TEMPLATE,
                         about.trainer_id
                     ));
@@ -822,8 +830,8 @@ fn trainer_row(
                     }),
             )
             .on_hover_text(format!(
-                "reqlevel: the level a player needs, {level} here. 0 is the teaching spell's own \
-                 spellLevel, {own_level}, and a spellLevel of 0 is any level; the server logs a \
+                "reqlevel: the required player level, {level} here. 0 uses the teaching spell's \
+                 spellLevel ({own_level}), and a spellLevel of 0 means any level. The server logs a \
                  reqlevel equal to spellLevel as redundant."
             ));
         if levelled.changed() && reqlevel != lesson.level as i64 {
@@ -844,8 +852,8 @@ fn trainer_row(
                     .custom_parser(parse_money),
             )
             .on_hover_text(
-                "spellcost, in copper. Type 150, or 1s 50c, or 2g. The server sends it lowered by \
-                 the player's reputation discount with the trainer's faction.",
+                "spellcost, in copper. Enter 150, 1s 50c or 2g. The server applies the player's \
+                 reputation discount with the trainer's faction.",
             );
         if priced.changed() && cost != lesson.cost as i64 {
             write(subject, "spellcost", cost.to_string());
@@ -937,7 +945,7 @@ fn skill_cell(ui: &mut egui::Ui, menu: egui::Id, groups: &[services::SkillGroup]
             if let Ok(id) = filter.trim().parse::<u32>() {
                 let label = match services::skill_name(groups, id) {
                     Some(name) => format!("Use {id}, {name}"),
-                    None => format!("Use {id}, which SkillLine.dbc does not hold"),
+                    None => format!("Use {id} (not in SkillLine.dbc)"),
                 };
                 if ui.selectable_label(false, label).clicked() || typed.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     chosen = Some(id);
@@ -967,8 +975,8 @@ fn skill_cell(ui: &mut egui::Ui, menu: egui::Id, groups: &[services::SkillGroup]
             }
         });
     response.response.on_hover_text(
-        "reqskill: the SkillLine.dbc line the player must have, or no skill. Type in the menu to \
-         narrow it, or type an id to use it as it is.",
+        "reqskill: the SkillLine.dbc skill the player must have, or no skill. Type in the menu \
+         to filter it, or enter an id to use that id directly.",
     );
     chosen
 }
@@ -1009,20 +1017,23 @@ fn parse_money(text: &str) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
-// The cells both kinds of row share
+// The cells vendor rows and trainer rows share
 // ---------------------------------------------------------------------------
 
-/// A `condition_id`, as its number.
-fn condition_cell(ui: &mut egui::Ui, condition: u32, mut write: impl FnMut(String)) {
+/// A `condition_id`: its number, then what it tests and the buttons that
+/// choose or make one. `column` is what the condition window calls it.
+fn condition_cell(ui: &mut egui::Ui, column: &str, condition: u32, mut write: impl FnMut(String)) {
     let mut value = condition as i64;
     let changed = ui
         .add_sized(
             [NUMBER, CELL],
             egui::DragValue::new(&mut value).range(0..=i64::from(u32::MAX)).prefix("c"),
         )
-        .on_hover_text("condition_id: a row of `conditions` the player must meet to see it, or 0.")
+        .on_hover_text("condition_id: a `conditions` row the player must meet to see this row, or 0.")
         .changed();
-    if changed && value != condition as i64 {
+    let typed = (changed && value != condition as i64).then_some(value as u32);
+    let answered = super::conditions::cell(ui, egui::Id::new(("service-condition", column)), column, condition, Some(CONDITION));
+    if let Some(value) = typed.or(answered) {
         write(value.to_string());
     }
 }
@@ -1039,8 +1050,8 @@ fn remove_or_keep(
     let now = subject.now;
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         let (label, about) = match life {
-            Life::Delete => ("keep", "Take the removal mark off this row."),
-            _ => ("\u{d7}", "Remove this row. The item or the spell itself is not touched."),
+            Life::Delete => ("keep", "Cancel the removal of this row."),
+            _ => ("\u{d7}", "Remove this row. The item or spell itself is not changed."),
         };
         if ui.small_button(label).on_hover_text(about).clicked() {
             match life {

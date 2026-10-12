@@ -742,6 +742,23 @@ fn label(
     // device ones: `size` spaces the line, `size * dpi` draws the glyphs.
     let raster = size * if painter.dpi.is_finite() && painter.dpi > 0.0 { painter.dpi } else { 1.0 };
 
+    // Whether the glyphs come from more than one atlas page. The passes below
+    // are one batch per page run, and every batch of an item has the same z,
+    // so the phase draws equal-z batches in whatever order it sorts them. On
+    // one page each pass merges into the same batch and the order inside a
+    // batch is the emission order, which is correct. Across pages, a page-1
+    // outline batch could draw after the page-1 glyph batch and cover the
+    // glyphs with their own black copies: zone text "Ironforge" with black
+    // shapes over the n, f and g, which had been rasterised on a second page.
+    // So a text that spans pages puts the shadow and the glyphs on layers of
+    // their own above the outline. A text on one page stays one batch.
+    let spans_pages = spans_pages(placed.iter().filter_map(|glyph| {
+        painter
+            .fonts
+            .glyph(painter.images, face, raster, glyph.ch)
+            .map(|sprite| sprite.page)
+    }));
+
     // The outline first, then the shadow, then the glyphs — the same ring of
     // eight offsets the egui painter draws, for the same reason.
     let radius = paint.outline.radius() * scale;
@@ -762,6 +779,9 @@ fn label(
         }
     }
     if let Some((offset, shadow_colour)) = paint.shadow {
+        if spans_pages {
+            emit.layer();
+        }
         glyphs(
             emit,
             painter,
@@ -779,7 +799,20 @@ fn label(
         .iter()
         .map(|p| p.colour.map(|c| tint(c, 1.0)))
         .collect();
+    if spans_pages {
+        emit.layer();
+    }
     glyphs_with(emit, painter, &placed, face, raster, [0.0, 0.0], colour, &run_tints, clip);
+}
+
+/// Whether a text's glyphs are on more than one atlas page. See the note in
+/// the text function where it is asked.
+fn spans_pages(pages: impl IntoIterator<Item = usize>) -> bool {
+    let mut pages = pages.into_iter();
+    let Some(first) = pages.next() else {
+        return false;
+    };
+    pages.any(|page| page != first)
 }
 
 /// One pass over the placed glyphs at one offset, in one colour.
@@ -999,7 +1032,7 @@ fn disc(
     clip: Option<[f32; 4]>,
     uv_at: impl Fn(Vec2) -> Vec2,
 ) {
-    const SEGMENTS: usize = 48;
+    const SEGMENTS: usize = DISC_SEGMENTS;
     let centre = Vec2::new((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0);
     let radius = ((rect[2] - rect[0]).min(rect[3] - rect[1]) / 2.0).max(0.0);
     let faded = [colour[0], colour[1], colour[2], 0.0];
@@ -1023,7 +1056,8 @@ fn disc(
     emit.raw(image, blend, &vertices, &indices, clip);
 }
 
-/// The minimap: tiles through the disc, then the player arrow —
+/// The minimap: the terrain tiles through the disc, or inside a building its
+/// pictures (see [`interior`]), then the dots and the player arrow —
 /// `framexml::minimap` with the per-tile clip done by the triangle clipper.
 fn minimap(
     emit: &mut Emitter,
@@ -1040,10 +1074,16 @@ fn minimap(
     let colour = tint([1.0, 1.0, 1.0, 1.0], item.alpha);
     let index = painter.assets.minimap_tiles();
     painter.textures.minimap_tick += 1;
-    let radius = vale_assets::tables::minimap::radius_yards(widget.zoom, view.indoors);
-    for tile in
+    let radius =
+        vale_assets::tables::minimap::radius_yards(widget.level(view.indoors), view.indoors);
+    // Inside a building the terrain is not drawn; see `interior`.
+    let terrain = if view.indoors {
+        interior(emit, painter, rect, clip, colour, item.alpha, radius);
+        Vec::new()
+    } else {
         vale_assets::tables::minimap::tiles_in_view(view.position.0, view.position.1, radius)
-    {
+    };
+    for tile in terrain {
         let Some(path) = index.texture(&view.directory, tile.tile.0, tile.tile.1) else {
             continue;
         };
@@ -1105,6 +1145,79 @@ fn minimap(
         colour,
         clip,
     );
+}
+
+/// How many sides the minimap's disc has: the same count [`disc`] draws, so a
+/// building picture is cut along the edge the terrain is.
+const DISC_SEGMENTS: usize = 48;
+
+/// The minimap inside a building: a black disc, which is what the 1.12.1
+/// client clears its interior map to, and the building's pictures over it in
+/// [`vale_assets::tables::minimap::place_pictures`]' order, each a turned
+/// quad cut to the disc and alpha-blended so a floor below shows through the
+/// gaps in the one above. The uv is inset by half a texel at each edge, as
+/// the client draws them.
+fn interior(
+    emit: &mut Emitter,
+    painter: &mut Painter,
+    rect: [f32; 4],
+    clip: Option<[f32; 4]>,
+    colour: [f32; 4],
+    alpha: f32,
+    radius: f32,
+) {
+    use vale_assets::tables::minimap as rule;
+    let white = painter.textures.white(painter.images);
+    disc(
+        emit,
+        &white,
+        Blend::Alpha,
+        rect,
+        solid_tint([0.0, 0.0, 0.0, 1.0], alpha),
+        clip,
+        |_| Vec2::splat(0.5),
+    );
+    let view = painter.place;
+    let Some(inside) = view.interior.as_ref() else {
+        return;
+    };
+    let index = painter.assets.minimap_tiles();
+    let centre = [(rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0];
+    let reach = ((rect[2] - rect[0]).min(rect[3] - rect[1]) / 2.0 - 0.5).max(0.0);
+    let at = |[u, v]: [f32; 2]| [rect[0] + u * (rect[2] - rect[0]), rect[1] + v * (rect[3] - rect[1])];
+    let position = [view.position.0, view.position.1, view.elevation];
+    for picture in inside.pictures(position, radius) {
+        let polygon =
+            rule::clip_to_disc(picture.corners.map(at), rule::PICTURE_UV, centre, reach, DISC_SEGMENTS);
+        if polygon.is_empty() {
+            continue;
+        }
+        let Some(path) =
+            index.interior_texture(&inside.model.stem, picture.group, picture.x, picture.y)
+        else {
+            continue;
+        };
+        let Some(image) = painter.textures.minimap_texture(painter.images, painter.assets, &path)
+        else {
+            continue;
+        };
+        let (width, height) = painter
+            .images
+            .get(&image)
+            .map_or((256.0, 256.0), |i| (i.width().max(1) as f32, i.height().max(1) as f32));
+        let inset = Vec2::new(0.5 / width, 0.5 / height);
+        let vertices: Vec<V> = polygon
+            .iter()
+            .map(|(p, uv)| V {
+                pos: Vec2::from(*p),
+                uv: inset + Vec2::from(*uv) * (Vec2::ONE - inset * 2.0),
+                colour,
+            })
+            .collect();
+        let indices: Vec<u32> =
+            (1..vertices.len() as u32 - 1).flat_map(|i| [0, i, i + 1]).collect();
+        emit.raw(&image, Blend::Alpha, &vertices, &indices, clip);
+    }
 }
 
 /// The minimap dots and the two kinds of marker: the mesh form of
@@ -1219,6 +1332,38 @@ mod tests {
 
     fn image() -> Handle<Image> {
         Handle::default()
+    }
+
+    /// A text whose glyphs span two atlas pages draws its glyphs above its
+    /// outline whatever order the phase puts equal-z batches in: the main pass
+    /// is a layer of its own, so every glyph batch has a higher z than every
+    /// outline batch. Without the layer, the page-2 outline and glyph batches
+    /// had the same z, and the outline could draw over the glyphs.
+    #[test]
+    fn a_text_on_two_pages_draws_its_glyphs_over_its_outline() {
+        assert!(!spans_pages([0, 0, 0]));
+        assert!(spans_pages([0, 1, 0]));
+        assert!(!spans_pages(std::iter::empty()));
+
+        let page_a = image();
+        let page_b = Handle::<Image>::Uuid(bevy::asset::uuid::Uuid::from_u128(7), std::marker::PhantomData);
+        let mut emit = Emitter::new();
+        emit.item(0);
+        let quad = |emit: &mut Emitter, page: &Handle<Image>| {
+            emit.quad(page, Blend::Alpha, [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0], [1.0; 4], None);
+        };
+        // The outline pass over "In": I on page a, n on page b.
+        quad(&mut emit, &page_a);
+        quad(&mut emit, &page_b);
+        emit.layer();
+        // The glyph pass over the same two.
+        quad(&mut emit, &page_a);
+        quad(&mut emit, &page_b);
+        let batches = emit.into_batches();
+        assert_eq!(batches.len(), 4);
+        let outline = batches[0].z.max(batches[1].z);
+        let glyphs = batches[2].z.min(batches[3].z);
+        assert!(glyphs > outline, "every glyph batch sorts above every outline batch");
     }
 
     #[test]

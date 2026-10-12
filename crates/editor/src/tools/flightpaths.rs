@@ -68,6 +68,7 @@
 //! vmangos reads all three at startup only.
 
 use super::Tool;
+use crate::marks::{Look, Marks};
 use crate::session::EditSession;
 use vale_client::render::axes;
 use vale_client::render::focus::WorldFocus;
@@ -204,13 +205,16 @@ pub struct Flightpaths {
     pub transports: bool,
     /// A fly-to asked for by the panel, consumed by [`fly`].
     pub fly_to: Option<Vec3>,
-    /// …and the camera distance it asks for, when it asks for one: a path is
-    /// framed whole, a node or a point is not.
+    /// The camera distance that `fly_to` asks for, when it asks for one: a
+    /// path is framed whole, a node or a point is not.
     pub fly_distance: Option<f32>,
     /// Whether the command line's flight path flags have run, or none were
     /// given. `crate::server::release::migration_on_the_command_line` waits on
     /// it.
     pub scripted_done: bool,
+    /// Whether the archive chain holds the flight map picture of a map, by
+    /// map, read once per map and again after [`draw_flight_map`].
+    pub picture_known: Option<(u32, bool)>,
 }
 
 impl Default for Flightpaths {
@@ -237,6 +241,7 @@ impl Default for Flightpaths {
             fly_to: None,
             fly_distance: None,
             scripted_done: false,
+            picture_known: None,
         }
     }
 }
@@ -364,12 +369,13 @@ impl Flightpaths {
 /// flights cruise well above this; it is a floor for a point placed by hand.
 pub const DEFAULT_CLEARANCE: f32 = 40.0;
 
-/// How wide a handle is to the pointer, in logical pixels. The light tool's
-/// width, for the same reason: a point cannot be clicked, a disc can.
-const HANDLE_PIXELS: f32 = 12.0;
+/// How wide a handle is to the pointer, in logical pixels. The light tool
+/// uses the same width for the same reason: a handle is a point, so the
+/// pointer picks it within a disc of this width around it.
+pub(super) const HANDLE_PIXELS: f32 = 12.0;
 
 /// How far the pointer travels before a press on a handle becomes a drag.
-const DRAG_PIXELS: f32 = 4.0;
+pub(super) const DRAG_PIXELS: f32 = 4.0;
 
 /// How far from the camera a node marker is drawn and picked, in yards. A
 /// little past the block the editor streams.
@@ -488,9 +494,9 @@ fn rebuild(
 }
 
 /// The pointer's ray and the numbers that turn a distance off it into pixels.
-struct Aim {
-    origin: Vec3,
-    direction: Vec3,
+pub(super) struct Aim {
+    pub(super) origin: Vec3,
+    pub(super) direction: Vec3,
     /// The projection's `[1][1]`, `1 / tan(fov / 2)`.
     focal: f32,
     /// The window's height in logical pixels.
@@ -500,12 +506,12 @@ struct Aim {
 impl Aim {
     /// How many pixels a distance of `off` yards from the ray is, at `along`
     /// yards down it.
-    fn pixels(&self, off: f32, along: f32) -> f32 {
+    pub(super) fn pixels(&self, off: f32, along: f32) -> f32 {
         off / along * self.focal * self.height * 0.5
     }
 
     /// How far a point is from the ray in pixels, or `None` behind the eye.
-    fn to_point(&self, at: Vec3) -> Option<f32> {
+    pub(super) fn to_point(&self, at: Vec3) -> Option<f32> {
         let to = at - self.origin;
         let along = to.dot(self.direction);
         if along <= 0.0 {
@@ -541,7 +547,7 @@ fn ray_to_segment(origin: Vec3, direction: Vec3, a: Vec3, b: Vec3) -> Option<(f3
     Some((t, (origin + direction * t - on_segment).length()))
 }
 
-fn aim_of(
+pub(super) fn aim_of(
     windows: &Query<&Window>,
     camera: &Query<(&Camera, &GlobalTransform), With<WorldCamera>>,
 ) -> Option<Aim> {
@@ -558,7 +564,7 @@ fn aim_of(
 }
 
 /// The eye, in the world's axes.
-fn eye(camera: &Query<(&Camera, &GlobalTransform), With<WorldCamera>>) -> Option<Vec3> {
+pub(super) fn eye(camera: &Query<(&Camera, &GlobalTransform), With<WorldCamera>>) -> Option<Vec3> {
     let (_, at) = camera.single().ok()?;
     Some(Vec3::from(axes::to_wow(at.translation())))
 }
@@ -919,7 +925,7 @@ fn finish_draft(session: &mut EditSession, flights: &mut Flightpaths, to: u32) -
 
 /// Where the ray meets the upright plane through `at` that faces the camera
 /// across the ground: the plane a vertical drag moves in.
-fn meets_upright_plane(origin: Vec3, direction: Vec3, at: Vec3) -> Option<Vec3> {
+pub(super) fn meets_upright_plane(origin: Vec3, direction: Vec3, at: Vec3) -> Option<Vec3> {
     let normal = Vec3::new(direction.x, direction.y, 0.0).normalize_or_zero();
     let facing = direction.dot(normal);
     if normal == Vec3::ZERO || facing.abs() < 1e-4 {
@@ -1176,7 +1182,7 @@ fn make_path(
                 record(session, label, done);
                 flights.stale();
                 flights.path = there;
-                return format!("path {} made; the path back was not: {e}", there.unwrap_or(0));
+                return format!("path {} made; creating the return path failed: {e}", there.unwrap_or(0));
             }
         }
     }
@@ -1260,11 +1266,11 @@ fn keys(
     }
 }
 
-/// How wide a marker is drawn, in yards, at a distance: about the handle's
-/// width on screen, clamped.
-fn marker_radius(at: Vec3, eye: Vec3) -> f32 {
-    ((at - eye).length() * 0.02).clamp(0.6, 22.0)
-}
+/// How wide a marker is, in yards: a size in the world, drawn through
+/// `Marks::visible_radius` so a far one is still a dot. The pick is measured in
+/// pixels ([`HANDLE_PIXELS`]), so a far marker is as easy to click as a near
+/// one.
+pub(super) const MARKER_RADIUS: f32 = 2.0;
 
 /// A node's colour: by which sides vmangos offers it to, from its two mount
 /// columns (field 14 Horde, field 15 Alliance).
@@ -1278,11 +1284,14 @@ pub fn side_colour(mounts: [u32; 2]) -> Color {
 }
 
 /// Draw the nodes, the paths and the selected path's points.
+///
+/// A route that is selected, hovered or leaves the selected node, and every
+/// node and point, is [`Look::Ghosted`]: a mountain between it and the camera
+/// hides it to a faint line rather than not at all. The other routes are
+/// [`Look::Solid`].
 #[allow(clippy::too_many_arguments)]
 fn draw(
-    mut handles: Gizmos<super::gizmo::EditorHandles>,
-    mut marks: Gizmos<super::gizmo::WorldMarks>,
-    mut chosen: Gizmos<super::gizmo::PathMarks>,
+    mut marks: ResMut<Marks>,
     flights: Res<Flightpaths>,
     tool: Res<Tool>,
     state: Res<crate::playtest::Playtest>,
@@ -1321,13 +1330,14 @@ fn draw(
             if !leg_shown(&flights, route, a, b, eye) {
                 continue;
             }
-            match selected || under || of_node {
-                true => chosen.line(bevy(a), bevy(b), colour),
-                false => marks.line(bevy(a), bevy(b), colour),
-            }
+            let look = match selected || under || of_node {
+                true => Look::Ghosted,
+                false => Look::Solid,
+            };
+            marks.line(bevy(a), bevy(b), colour, look);
             // Which way the selected path flies: a chevron on every third leg.
             if selected && n % 3 == 1 {
-                chevron(&mut chosen, a, b, colour);
+                chevron(&mut marks, a, b, colour);
             }
         }
         if !selected {
@@ -1340,16 +1350,17 @@ fn draw(
                 (false, true) => Color::srgb(1.0, 0.9, 0.6),
                 _ => Color::srgb(1.0, 0.6, 0.15),
             };
-            handles.sphere(bevy(at), marker_radius(at, eye) * 0.6, colour);
+            let radius = marks.visible_radius(bevy(at), MARKER_RADIUS * 0.6);
+            marks.sphere(bevy(at), radius, colour, Look::Ghosted);
         }
-        // The selected point's drop to the ground, which is what says how high
-        // it is.
+        // A line from the selected point down to the ground, which shows its
+        // height.
         if let (Some((_, point)), Some(session)) =
             (flights.point.and_then(|id| flights.point(id)), session.as_ref())
         {
             let at = Vec3::from(point.at);
             if let Some(ground) = super::doodads::ground_height(session, at.x, at.y) {
-                handles.line(bevy(at), bevy(Vec3::new(at.x, at.y, ground)), lit.with_alpha(0.6));
+                marks.line(bevy(at), bevy(Vec3::new(at.x, at.y, ground)), lit.with_alpha(0.6), Look::Ghosted);
             }
         }
     }
@@ -1366,11 +1377,13 @@ fn draw(
             (false, true) => Color::srgb(1.0, 1.0, 0.8),
             _ => side_colour(node.mounts),
         };
-        let radius = marker_radius(at, eye);
-        handles.sphere(bevy(at), radius, colour);
-        handles.line(bevy(at), bevy(at + Vec3::Z * radius * 4.0), colour);
+        let radius = marks.visible_radius(bevy(at), MARKER_RADIUS);
+        marks.sphere(bevy(at), radius, colour, Look::Ghosted);
+        marks.line(bevy(at), bevy(at + Vec3::Z * radius * 4.0), colour, Look::Ghosted);
         if selected {
-            handles.sphere(bevy(at), radius * 1.6, side_colour(node.mounts));
+            // A shell around the node, in its side's colour, which the white
+            // of the selection would otherwise hide.
+            marks.sphere(bevy(at), radius * 1.6, side_colour(node.mounts).with_alpha(0.35), Look::Ghosted);
         }
     }
 
@@ -1379,7 +1392,7 @@ fn draw(
     match flights.armed {
         Armed::Connect { from } => {
             if let Some(node) = flights.node(from) {
-                handles.line(bevy(Vec3::from(node.at)), bevy(pointer), Color::srgb(0.5, 1.0, 0.5));
+                marks.line(bevy(Vec3::from(node.at)), bevy(pointer), Color::srgb(0.5, 1.0, 0.5), Look::Ghosted);
             }
         }
         Armed::AddPoints => {
@@ -1389,13 +1402,14 @@ fn draw(
                 let before = route.points.iter().find(|p| p.index + 1 == index);
                 let after = route.points.iter().find(|p| p.index == index);
                 for end in [before, after].into_iter().flatten() {
-                    handles.line(bevy(Vec3::from(end.at)), bevy(new), Color::srgb(1.0, 0.85, 0.5));
+                    marks.line(bevy(Vec3::from(end.at)), bevy(new), Color::srgb(1.0, 0.85, 0.5), Look::Ghosted);
                 }
-                handles.line(bevy(new), bevy(pointer), lit.with_alpha(0.5));
+                marks.line(bevy(new), bevy(pointer), lit.with_alpha(0.5), Look::Ghosted);
             }
         }
         Armed::NewNode => {
-            handles.sphere(bevy(pointer), marker_radius(pointer, eye), side_colour(NEW_NODE_MOUNTS));
+            let radius = marks.visible_radius(bevy(pointer), MARKER_RADIUS);
+            marks.sphere(bevy(pointer), radius, side_colour(NEW_NODE_MOUNTS), Look::Ghosted);
         }
         Armed::Draw { .. } | Armed::Nothing => {}
     }
@@ -1405,18 +1419,17 @@ fn draw(
 /// ground, and the leg the next click makes. The next point is red when it is
 /// below the ground under it.
 fn draw_draft(
-    mut handles: Gizmos<super::gizmo::EditorHandles>,
+    mut marks: ResMut<Marks>,
     flights: Res<Flightpaths>,
     tool: Res<Tool>,
     state: Res<crate::playtest::Playtest>,
     cursor: Res<crate::pick::Cursor>,
     session: Option<Res<EditSession>>,
-    camera: Query<(&Camera, &GlobalTransform), With<WorldCamera>>,
 ) {
     if !active(&tool, &state) {
         return;
     }
-    let (Some(draft), Some(eye)) = (flights.draft.as_ref(), eye(&camera)) else {
+    let Some(draft) = flights.draft.as_ref() else {
         return;
     };
     let Some(start) = flights.node(draft.from).map(|node| Vec3::from(node.at)) else {
@@ -1426,8 +1439,9 @@ fn draw_draft(
     let drawn = Color::srgb(0.5, 1.0, 0.5);
     let mut last = start;
     for &at in &draft.points {
-        handles.line(bevy(last), bevy(at), drawn);
-        handles.sphere(bevy(at), marker_radius(at, eye) * 0.6, drawn);
+        marks.line(bevy(last), bevy(at), drawn, Look::Ghosted);
+        let radius = marks.visible_radius(bevy(at), MARKER_RADIUS * 0.6);
+        marks.sphere(bevy(at), radius, drawn, Look::Ghosted);
         last = at;
     }
     // A hovered far node is where the next click ends the path.
@@ -1435,7 +1449,7 @@ fn draw_draft(
         Some(Handle::Node(id)) if id != draft.from => flights.node(id).map(|node| Vec3::from(node.at)),
         _ => None,
     } {
-        handles.line(bevy(last), bevy(end), Color::WHITE);
+        marks.line(bevy(last), bevy(end), Color::WHITE, Look::Ghosted);
         return;
     }
     let Some(next) = draft.next(cursor.surface) else { return };
@@ -1446,29 +1460,31 @@ fn draw_draft(
         Some(ground) if next.z < ground => Color::srgb(1.0, 0.3, 0.25),
         _ => Color::srgb(1.0, 0.85, 0.5),
     };
-    handles.line(bevy(last), bevy(next), colour.with_alpha(0.7));
-    handles.sphere(bevy(next), marker_radius(next, eye) * 0.6, colour);
+    marks.line(bevy(last), bevy(next), colour.with_alpha(0.7), Look::Ghosted);
+    let radius = marks.visible_radius(bevy(next), MARKER_RADIUS * 0.6);
+    marks.sphere(bevy(next), radius, colour, Look::Ghosted);
     if let Some(ground) = ground {
-        handles.line(bevy(next), bevy(next.truncate().extend(ground)), Color::WHITE.with_alpha(0.6));
+        marks.line(bevy(next), bevy(next.truncate().extend(ground)), Color::WHITE.with_alpha(0.6), Look::Ghosted);
     }
 }
 
-/// An arrowhead at the middle of a leg, pointing from `a` to `b`.
-fn chevron(gizmos: &mut Gizmos<super::gizmo::PathMarks>, a: Vec3, b: Vec3, colour: Color) {
-    let along = (b - a).truncate();
+/// A cone at the middle of a leg, pointing from `a` to `b`.
+fn chevron(marks: &mut Marks, a: Vec3, b: Vec3, colour: Color) {
+    let along = b - a;
     let length = along.length();
     if length < 1.0 {
         return;
     }
-    let forward = along / length;
-    let side = Vec2::new(-forward.y, forward.x);
     let size = (length * 0.15).clamp(2.0, 12.0);
     let tip = (a + b) * 0.5;
-    for sign in [1.0, -1.0] {
-        let tail = tip.truncate() - forward * size + side * size * 0.6 * sign;
-        let tail = Vec3::new(tail.x, tail.y, tip.z);
-        gizmos.line(axes::to_bevy(tail.to_array()), axes::to_bevy(tip.to_array()), colour);
-    }
+    let base = tip - along / length * size;
+    marks.cone(
+        axes::to_bevy(base.to_array()),
+        axes::to_bevy(tip.to_array()),
+        size * 0.35,
+        colour.with_alpha(1.0),
+        Look::Ghosted,
+    );
 }
 
 /// Take the camera to a place the panel asked for.
@@ -1491,10 +1507,12 @@ pub fn framing_distance(across: f32) -> f32 {
 
 /// The command line's flight path flags, once the tables are read and, for a
 /// new node, the ground under it is open: `--taxi-node`, `--taxi-path`,
-/// `--taxi-connect` and `--taxi-node-add`.
+/// `--taxi-connect`, `--taxi-node-add` and `--flight-map`.
+#[allow(clippy::too_many_arguments)]
 fn scripted(
     mut flights: ResMut<Flightpaths>,
     args: Res<crate::Args>,
+    assets: Res<vale_client::assets::GameAssets>,
     mut session: Option<ResMut<EditSession>>,
     tool: Res<Tool>,
     state: Res<crate::playtest::Playtest>,
@@ -1503,7 +1521,8 @@ fn scripted(
     let asked = args.taxi_node.is_some()
         || args.taxi_path.is_some()
         || args.taxi_connect.is_some()
-        || args.taxi_node_add.is_some();
+        || args.taxi_node_add.is_some()
+        || args.flight_map;
     if *done {
         return;
     }
@@ -1525,6 +1544,18 @@ fn scripted(
         info!("--taxi-node-add: {line}");
         session.status = line;
         rebuilt(session, &mut flights);
+    }
+    if args.flight_map {
+        use vale_edit::flightmap;
+        if !session.open_table(&assets, flightmap::TABLE) || !session.open_table(&assets, WORLD_MAP_AREA) {
+            return;
+        }
+        let line = match flight_map(session, &flights) {
+            Some(FlightMap::Shipped) => "this map is a continent of the world map; its flight map is shipped".to_string(),
+            _ => make_flight_map(session, &assets, &mut flights),
+        };
+        info!("--flight-map: {line}");
+        session.status = line;
     }
     if let Some((from, to)) = args.taxi_connect {
         let (with_return, clearance) = (flights.with_return, flights.clearance);
@@ -1588,6 +1619,143 @@ fn rebuilt(session: &EditSession, flights: &mut Flightpaths) -> Option<()> {
         map,
     );
     Some(())
+}
+
+/// What the open map's flight map is.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FlightMap {
+    /// The map is a continent of the world map, whose flight map the game
+    /// ships.
+    Shipped,
+    /// The map has no `WorldMapContinent` row, so the client opens no flight
+    /// map here.
+    Missing,
+    /// The map has a row: its box, and the nodes outside it, which the client
+    /// does not draw.
+    Made { flight: vale_edit::flightmap::FlightMap, outside: Vec<u32> },
+}
+
+/// The open map's flight map. `None` while the tables are not open.
+pub fn flight_map(session: &EditSession, flights: &Flightpaths) -> Option<FlightMap> {
+    use vale_edit::flightmap;
+    let continents = session.table(flightmap::TABLE)?;
+    let areas = session.table(WORLD_MAP_AREA)?;
+    let continent = (0..areas.record_count()).any(|record| {
+        areas.u32_at(record, 1) == Some(flights.map) && areas.u32_at(record, 2) == Some(0)
+    });
+    if continent {
+        return Some(FlightMap::Shipped);
+    }
+    let Some(flight) = flightmap::row_of(continents, flights.map).and_then(|record| flightmap::read(continents, record)) else {
+        return Some(FlightMap::Missing);
+    };
+    let outside = flights.nodes.iter().filter(|node| !flight.holds(node.at[0], node.at[1])).map(|node| node.id).collect();
+    Some(FlightMap::Made { flight, outside })
+}
+
+/// The table whose continent rows (area 0) mark a map as one of the world
+/// map's continents: field 1 is the map, field 2 the area.
+pub const WORLD_MAP_AREA: &str = "WorldMapArea";
+
+/// Give the open map a flight map, or fit the one it has to its tiles and
+/// nodes: write its `WorldMapContinent` row as one undo entry, and draw the
+/// picture. Answers what happened, for the status line.
+pub fn make_flight_map(session: &mut EditSession, assets: &vale_client::assets::GameAssets, flights: &mut Flightpaths) -> String {
+    use vale_edit::flightmap;
+    if session.map_id != flights.map {
+        return "the flight path tool is still reading this map".to_string();
+    }
+    let index = minimap_index(assets);
+    let mut tiles: Vec<(u32, u32)> = session.claimed.iter().copied().collect();
+    tiles.extend(index.tiles_of(&session.map));
+    tiles.sort_unstable();
+    tiles.dedup();
+    let nodes: Vec<[f32; 2]> = flights.nodes.iter().map(|node| [node.at[0], node.at[1]]).collect();
+    let Some(flight) = flightmap::plan(flights.map, &tiles, &nodes) else {
+        return "this map has no tiles and no nodes to make a flight map of".to_string();
+    };
+    let Some(table) = session.table_mut(flightmap::TABLE) else {
+        return format!("{} is not open", flightmap::TABLE);
+    };
+    let written = match flightmap::write(table, &flight) {
+        Ok(written) => written,
+        Err(why) => return why.to_string(),
+    };
+    session.history.begin("Make flight map");
+    match written {
+        flightmap::Written::Added(row) => session.history.record_row(flightmap::TABLE, row),
+        flightmap::Written::Changed(cells) => {
+            for cell in cells {
+                session.history.record_cell(flightmap::TABLE, cell);
+            }
+        }
+    }
+    session.history.end();
+    session.table_edited(flightmap::TABLE);
+    let side = flight.taxi_box[2] - flight.taxi_box[0];
+    let drawn = draw_flight_map(session, assets, flights, &flight);
+    format!("flight map for map {}: {side:.0} yards square; {drawn}", flight.map)
+}
+
+/// Draw the flight map picture of `flight` from the map's minimap tiles and
+/// write it into the project. Answers what happened.
+pub fn draw_flight_map(
+    session: &mut EditSession,
+    assets: &vale_client::assets::GameAssets,
+    flights: &mut Flightpaths,
+    flight: &vale_edit::flightmap::FlightMap,
+) -> String {
+    use vale_assets::world::blp;
+    use vale_edit::flightmap;
+    let index = minimap_index(assets);
+    let directory = session.map.clone();
+    let mut drawn = 0usize;
+    let rgba = flightmap::picture(flight.taxi_box, |col, row| {
+        let path = index.texture(&directory, col, row)?;
+        let bytes = assets.with_archive(|chain| Ok(chain.read(&path).ok())).ok().flatten()?;
+        let picture = blp::decode(&bytes).ok()?;
+        let side = flightmap::TILE_SIDE;
+        (picture.width == side && picture.height == side).then(|| {
+            drawn += 1;
+            picture.rgba
+        })
+    });
+    let bytes = match blp::encode_dxt1(&rgba, flightmap::SIDE, flightmap::SIDE) {
+        Ok(bytes) => bytes,
+        Err(why) => return format!("the picture could not be encoded: {why}"),
+    };
+    let path = vale_assets::tables::taxi::map_art(flight.map);
+    if !session.save_bytes(&path, bytes) {
+        return format!("{path} could not be written");
+    }
+    flights.picture_known = Some((flight.map, true));
+    match drawn {
+        0 => "the picture is blank: no minimap tile of this map is drawn".to_string(),
+        n => format!("picture drawn from {n} minimap tile(s)"),
+    }
+}
+
+/// Whether the archive chain holds the open map's flight map picture, read
+/// once per map.
+pub fn has_picture(assets: &vale_client::assets::GameAssets, flights: &mut Flightpaths) -> bool {
+    if let Some((map, known)) = flights.picture_known {
+        if map == flights.map {
+            return known;
+        }
+    }
+    let path = vale_assets::tables::taxi::map_art(flights.map);
+    let known = assets.with_archive(|chain| Ok(chain.read(&path).is_ok())).unwrap_or(false);
+    flights.picture_known = Some((flights.map, known));
+    known
+}
+
+/// The minimap index as the archive chain holds it now, the project's own
+/// tiles included. Read each time rather than through the cached copy,
+/// which predates any tile drawn this session.
+fn minimap_index(assets: &vale_client::assets::GameAssets) -> vale_assets::tables::minimap::MinimapTiles {
+    use vale_assets::tables::minimap::{MinimapTiles, MD5_TRANSLATE};
+    let raw = assets.with_archive(|chain| Ok(chain.read(MD5_TRANSLATE).ok())).ok().flatten().unwrap_or_default();
+    MinimapTiles::parse(&raw)
 }
 
 #[cfg(test)]

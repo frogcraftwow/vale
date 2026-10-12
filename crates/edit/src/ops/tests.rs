@@ -327,7 +327,9 @@ fn a_paint_stroke_lands_where_the_pointer_is() {
         strength: 4.0,
         falloff: Falloff::Smooth,
         shape: Shape::Circle,
-        core: 0.0,
+        // The centre is in the full-strength core, which is what reaches
+        // the opacity; see `PaintBrush`.
+        core: 0.35,
         texture: "Tileset\\Generic\\Black.blp".into(),
         effect_id: 0,
         ..PaintBrush::default()
@@ -687,7 +689,9 @@ fn a_weak_brush_still_reaches_opaque_if_it_is_held() {
         strength: 0.2,
         falloff: Falloff::Smooth,
         shape: Shape::Circle,
-        core: 0.0,
+        // The centre is in the full-strength core, which is what reaches
+        // the opacity; see `PaintBrush`.
+        core: 0.35,
         texture: "Tileset\\Generic\\Black.blp".into(),
         effect_id: 0,
         ..PaintBrush::default()
@@ -1074,6 +1078,42 @@ fn a_stroke_converges_on_its_opacity_from_either_side() {
     hold(&mut tile, &half, which, 6.0);
     let from_above = centre_of(&tile, which, top);
     assert!((110..=145).contains(&from_above), "from above: {from_above}");
+}
+
+/// **A held stroke stays inside its own footprint.** A texel most of the way
+/// to the rim settles at about the falloff's weight there and goes no further
+/// however long the brush is held, and one past the rim is not touched.
+///
+/// The brush this replaced moved every texel toward full opacity and used the
+/// weight only as the speed, so a held brush painted out to its whole radius;
+/// six seconds at strength 4 left this texel nearly opaque.
+#[test]
+fn a_held_stroke_stays_inside_its_footprint() {
+    use vale_assets::world::adt::ALPHA_SIDE;
+    let Some(mut tile) = tile() else { return };
+    let Some(which) = room_for_a_layer(&tile) else {
+        return;
+    };
+    // Its own falloff and core, so the band it checks does not move with the
+    // defaults.
+    let brush = crate::ops::PaintBrush {
+        falloff: Falloff::Smooth,
+        core: 0.35,
+        ..paint_brush("Tileset\\Generic\\Black.blp")
+    };
+    hold(&mut tile, &brush, which, 6.0);
+    let top = crate::adt::alpha::paint(tile.chunk(which).unwrap()).len() - 1;
+    let map = &crate::adt::alpha::paint(tile.chunk(which).unwrap()).maps[top];
+    let row = ALPHA_SIDE / 2 * ALPHA_SIDE;
+    // Eleven texels out is most of the way across an 8-yard brush, where
+    // the falloff's weight is a small fraction.
+    let edge = map[row + ALPHA_SIDE / 2 + 11];
+    assert!((8..=110).contains(&edge), "near the rim: {edge}");
+    hold(&mut tile, &brush, which, 6.0);
+    let again = crate::adt::alpha::paint(tile.chunk(which).unwrap()).maps[top][row + ALPHA_SIDE / 2 + 11];
+    assert!(again > edge, "a second stroke builds on the first: {edge} then {again}");
+    assert!(map[row + ALPHA_SIDE / 2] > 230, "the centre is opaque");
+    assert_eq!(map[row + ALPHA_SIDE / 2 + 17], 0, "past the rim is untouched");
 }
 
 /// An eraser takes the texture's own layer toward transparent and adds
@@ -1537,6 +1577,73 @@ fn a_selection_of_vertices_moves_together_and_can_be_kept_from_a_brush() {
         edit.revert(&mut tile);
     }
     assert_eq!(tile.write(), bytes);
+}
+
+/// Locked vertices stay where they are whatever moved the ground, the rest of
+/// the stroke stands, and the edits that remain still undo to the original
+/// bytes.
+#[test]
+fn locked_vertices_are_held_through_any_edit() {
+    use crate::adt::heights;
+    use crate::ops::vertices::Selected;
+    let Some(mut tile) = tile() else { return };
+    let bytes = tile.write();
+    let origin = tile.chunk(17).unwrap().head().position();
+    let at = [origin[0], origin[1]];
+    let mut locked = Selected::default();
+    locked.mark(&tile, at, 6.0, Shape::Circle, true);
+    let corner = |tile: &AdtFile, chunk: usize, row: usize, column: usize| {
+        heights::heights(tile.chunk(chunk).unwrap())[heights::outer(row, column).unwrap()]
+    };
+    let was = corner(&tile, 17, 0, 0);
+    let beside = corner(&tile, 17, 4, 4);
+
+    let brush = Brush {
+        radius: 30.0,
+        strength: 20.0,
+        ..Brush::default()
+    };
+    let mut edits = brush.stroke(&mut tile, at, 0.5, None);
+    assert!(locked.hold(&mut tile, &mut edits) > 0);
+    assert_eq!(corner(&tile, 17, 0, 0), was, "the locked vertex did not move");
+    assert_eq!(corner(&tile, 0, 8, 8), was, "nor did its copy in the next chunk");
+    assert!(corner(&tile, 17, 4, 4) > beside + 1.0, "the unlocked ground rose");
+    // Each remaining height edit agrees with the tile, and the normals were
+    // worked out from the held heights.
+    for edit in &edits {
+        if let Edit::Heights { chunk, after, .. } = edit {
+            assert_eq!(&heights::heights(tile.chunk(*chunk).unwrap()), after);
+        }
+    }
+    let shaded = tile.write();
+    for edit in &edits {
+        if let Edit::Normals { chunk, .. } = edit {
+            heights::recompute_normals(&mut tile, *chunk);
+        }
+    }
+    assert_eq!(tile.write(), shaded, "the normals match the held heights");
+
+    for edit in edits.iter().rev() {
+        edit.revert(&mut tile);
+    }
+    assert_eq!(tile.write(), bytes);
+
+    // A tile's sides are found by position: every vertex the set names lies
+    // on the tile's boundary, and it names some on all four.
+    let sides = Selected::tile_sides(&tile);
+    let positions = sides.positions(&tile);
+    let side = 16.0 * vale_assets::world::adt::CHUNK_SIZE;
+    let top_x = positions.iter().map(|p| p[0]).fold(f32::MIN, f32::max);
+    let top_y = positions.iter().map(|p| p[1]).fold(f32::MIN, f32::max);
+    let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+    assert!(positions
+        .iter()
+        .all(|p| near(p[0], top_x) || near(p[0], top_x - side) || near(p[1], top_y) || near(p[1], top_y - side)));
+    assert!(positions.iter().any(|p| near(p[0], top_x - side)));
+    assert!(positions.iter().any(|p| near(p[1], top_y - side)));
+    // 16 chunks a side, 9 outer vertices each, 4 sides; the corner chunk's
+    // corner vertex is on two sides and is one entry.
+    assert_eq!(sides.count(), 16 * 9 * 4 - 4);
 }
 
 /// A selection tilts onto a plane through its centre, smooths toward its

@@ -365,7 +365,7 @@ pub fn tools(server: &super::settings::ServerSettings) -> Result<Tools, String> 
     let dir = server.tools.trim();
     if dir.is_empty() {
         return Err(format!(
-            "no vmangos tools: set the folder on the Server panel, or {}",
+            "no vmangos tools folder: set it on the Server panel, or set {}",
             datadir::TOOLS_ENV
         ));
     }
@@ -377,7 +377,7 @@ pub fn tools(server: &super::settings::ServerSettings) -> Result<Tools, String> 
 pub fn data_dir(server: &super::settings::ServerSettings) -> Result<PathBuf, String> {
     let conf = server
         .conf_path()
-        .ok_or_else(|| "no mangosd.conf: set it on the Server panel, or VALE_MANGOSD".to_string())?;
+        .ok_or_else(|| "no mangosd.conf: set it on the Server panel, or set VALE_MANGOSD".to_string())?;
     if !conf.is_file() {
         return Err(format!("{} is not a file", conf.display()));
     }
@@ -477,7 +477,7 @@ impl Staging {
         let data_dir = std::path::absolute(gamedata_dir).map_err(|e| e.to_string())?;
         let into = project
             .path_for(super::patch::STAGE)
-            .ok_or_else(|| "the staging folder leaves the project".to_string())?;
+            .ok_or_else(|| "the staging folder is outside the project folder".to_string())?;
         let _ = std::fs::remove_dir_all(&into);
         let as_name = vale_edit::project::next_patch_name(&data_dir)
             .unwrap_or_else(|| "Patch-Z.MPQ".to_string());
@@ -588,8 +588,11 @@ impl Run {
             false => Archive::Staged,
         };
         // The archive is built from the project folder, so the edits on
-        // screen are written there first.
+        // screen are written there first: the tiles, and the tables, since
+        // the extractors find a new map only in the archive's `Map.dbc`.
         session.save_all();
+        session.save_all_tables();
+        repair_project_wdts(session);
         let which = match chosen {
             Some(tiles) => Which::Named {
                 map: session.map.clone(),
@@ -634,7 +637,7 @@ impl Run {
         if dirty.is_empty() {
             return Ok(Ran::Nothing(match self.which {
                 Which::Changed => "no server tile has changed since the last regeneration",
-                Which::Named { .. } => "none of the selection can be regenerated",
+                Which::Named { .. } => "no selected tile can be regenerated",
             }
             .to_string()));
         }
@@ -661,7 +664,7 @@ impl Run {
             }
             Archive::Staged => {
                 let staging = Staging::build(project, &self.reader.gamedata_dir)?;
-                step.set("staging a copy of the install for the tools", 0, 0);
+                step.set("staging a copy of the client install for the map tools", 0, 0);
                 (staging.stage(), Some(staging), Vec::new())
             }
         };
@@ -669,6 +672,7 @@ impl Run {
         let request = client_root.map(|client_root| Request {
             client_root,
             tiles: dirty.iter().map(|d| (d.tile, d.reach)).collect(),
+            carried: dirty.iter().filter(|d| d.hash.is_some()).map(|d| d.tile).collect(),
             heights_as_int: datadir::heights_as_int(&self.data_dir, dirty[0].tile.map),
             dll_dirs: self.dll_dirs,
         });
@@ -717,14 +721,14 @@ fn finish(session: &mut EditSession, ran: Result<Ran, String>) {
             let mut line = outcome.line();
             if let Err(e) = recorded {
                 line.push_str(&format!(
-                    " — but {LIVE_RECORD} could not be written ({e}), so the next \
-                     regeneration does them again"
+                    " — {LIVE_RECORD} could not be written ({e}), so the next \
+                     regeneration repeats these tiles"
                 ));
             }
             for (name, why) in &left {
                 line.push_str(&format!(
                     "; {name} could not be removed ({why}) and still holds the project's older \
-                     files — close what has it open and regenerate again"
+                     files — close the program that has it open and regenerate again"
                 ));
             }
             session.status = line;
@@ -766,7 +770,7 @@ pub fn regenerate(
         return "a server write is still running".to_string();
     }
     if chosen.is_some_and(|tiles| tiles.is_empty()) {
-        return "none of the selection can be regenerated".to_string();
+        return "no selected tile can be regenerated".to_string();
     }
     let run = match Run::gather(session, assets, server, chosen) {
         Ok(run) => run,
@@ -787,7 +791,30 @@ pub fn regenerate(
             })
         }),
     );
-    format!("{label} \u{2014} the bar says which step is running")
+    format!("{label} \u{2014} the progress bar shows the current step")
+}
+
+/// Give every map WDT the project carries the zero-length `MWMO` a terrain map
+/// ships with, when it lacks one, and write it back. A new map's WDT was
+/// written without it before, and vmangos' extractors skip such a map.
+pub(super) fn repair_project_wdts(session: &mut EditSession) {
+    let maps: Vec<String> = session.maps.iter().map(|(_, name)| name.clone()).collect();
+    for map in maps {
+        let path = vale_edit::wdt::wdt_path(&map);
+        let Some(bytes) = session.project.read(&path) else {
+            continue;
+        };
+        let Ok(mut wdt) = vale_edit::wdt::WdtFile::parse(&bytes) else {
+            continue;
+        };
+        if !wdt.repair_terrain_shape() {
+            continue;
+        }
+        match session.project.write(&path, &wdt.write()) {
+            Ok(_) => info!("server tiles: {path} given the empty MWMO the server's extractors need"),
+            Err(e) => warn!("server tiles: {path}: {e}"),
+        }
+    }
 }
 
 /// `--regenerate`: the Server panel's *Regenerate changed tiles*, from a

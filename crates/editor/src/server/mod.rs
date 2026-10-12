@@ -4,11 +4,11 @@
 //! ```text
 //! reload.rs      the chat wire: a GM command sent on the playtest's own
 //!                session, and the server's answer matched back to it
-//! rows.rs        the rows the server keeps of four client tables, written as
+//! rows.rs        the rows the server keeps of five client tables, written as
 //!                a diff of the project's DBC against the archives': Spell.dbc
 //!                to spell_template, TaxiNodes.dbc to taxi_nodes,
 //!                SkillLineAbility.dbc to skill_line_ability, AreaTable.dbc to
-//!                area_template
+//!                area_template, AreaTrigger.dbc to areatrigger_template
 //! mod.rs         `save`, the one function every subject's SQL is written by,
 //!                and the statements run when the Server panel's switch is on
 //! creatures.rs   creature_template and creature, which have no client file,
@@ -31,6 +31,11 @@
 //!                eleven *_scripts tables as whole scripts under an id, since a
 //!                script row has no key; live on a reload of the events, the
 //!                lists and five of the script tables
+//! places.rs      three row subjects over one set of row rules: maps (a new
+//!                map's map_template row), area triggers (their template's
+//!                script columns, teleports, inns, quest objectives,
+//!                battleground entrances) and graveyards (which safe place
+//!                serves which zone, and its facing)
 //! fresh.rs       keeping what was read from the database no longer than it
 //!                is true: one counter every apply and put back moves, a cache
 //!                that empties when it does, and the test that every read checks
@@ -41,7 +46,7 @@
 //!                before is put back, then each row is read, its undo kept and
 //!                its statements run, so the database always holds what it
 //!                held before plus what the project says now
-//! stack.rs       the order the seven row subjects stand in the database: to
+//! stack.rs       the order the ten row subjects stand in the database: to
 //!                apply or put back one, every applied subject after it is put
 //!                back first and applied again after, so each revert file runs
 //!                against the database it was read from
@@ -148,6 +153,7 @@ pub mod held;
 pub mod items;
 pub mod loot;
 pub mod patch;
+pub mod places;
 pub mod queue;
 pub mod quests;
 pub mod reconcile;
@@ -206,10 +212,11 @@ pub fn save(
     loot::save(session);
     services::save(session);
     behaviour::save(session);
+    places::save(session);
     // The client-table rows, which are a diff of two files rather than a
     // store, and which return their own apply under the same switch.
     if let Some(work) = rows::save(session, assets, server) {
-        queue.push("applying spells", work);
+        queue.push("applying client table rows", work);
     }
     // The DBC files the server reads from DataDir\5875\dbc go with the rows under
     // the same switch. They need no database, only the folder.

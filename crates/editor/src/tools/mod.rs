@@ -63,6 +63,13 @@
 //!                opened from a selected creature and a third from either.
 //!                Events and lists are rows of the store; a script is
 //!                replaced whole, since its rows have no key
+//! gossip.rs      what a creature says when spoken to: `gossip_menu`, the
+//!                `gossip_menu_option` choices under it and the `npc_text`
+//!                each menu row shows, read for the menus one creature leads
+//!                to, and what an edit to each is
+//! conditions.rs  the `conditions` table, read whole, and what an edit to a
+//!                condition is. Any form whose column names a condition opens
+//!                the window on it
 //! waypoints.rs   the path a creature walks: `creature_movement`, drawn over
 //!                the ground, its points picked, dragged, added and removed. A
 //!                mode of the creature tool rather than an entry on the rail,
@@ -72,9 +79,19 @@
 //!                added and removed. Client tables whose rows are places, so
 //!                the tool keeps the viewport, as lights.rs does
 //! lights.rs      Light.dbc's spheres, drawn on the map, picked with the
-//!                pointer and flown to. A client table whose row is also a
+//!                pointer, flown to and made. A client table whose row is also a
 //!                position, so, like flightpaths.rs, it is a DBC tool that
 //!                keeps the viewport
+//! triggers.rs    AreaTrigger.dbc's spheres and boxes on the map, picked,
+//!                dragged, made and removed, and the server rows that say what
+//!                each does: a teleport, an inn, a quest objective
+//! graveyards.rs  WorldSafeLocs.dbc's places on the map, where a released
+//!                spirit appears, and the server rows that link each to the
+//!                zones it serves and give its facing
+//! maps.rs        a new map: its Map.dbc row, a WDT with no tiles in the
+//!                project, and its map_template row with a dungeon's parent
+//!                and ghost entrance. Not a pointer tool: the
+//!                map window drives it
 //! tiles.rs       the tile itself: making ground where there was none, and the
 //!                shadow bake and minimap picture that no other edit keeps in
 //!                step. Not a pointer tool: the map window drives it
@@ -117,21 +134,25 @@
 //!
 //! ## Where tiles are opened
 //!
-//! [`open_tiles`] parses the square of tiles `TerrainReach` names around the
-//! focus (7x7 by default), one tile a frame. It is not part of the terrain
-//! tool: the doodad pick reads the same `AdtFile` to find which `MDDF` entry
-//! was clicked, so the function sits here, shared by both.
+//! [`open_tiles`] reads and parses the square of tiles `TerrainReach` names
+//! around the focus (7x7 by default) on the task pool, and puts each in the
+//! session when it is ready. It is not part of the terrain tool: the doodad
+//! pick reads the same `AdtFile` to find which `MDDF` entry was clicked, so
+//! the function sits here, shared by both.
 
 pub mod areas;
 pub mod behaviour;
 pub mod chunks;
+pub mod conditions;
 pub mod creatures;
 pub mod displays;
 pub mod doodads;
 pub mod flightpaths;
 pub mod gameobjects;
 pub mod gizmo;
+pub mod gossip;
 pub mod grade;
+pub mod graveyards;
 pub mod guides;
 pub mod group;
 pub mod holes;
@@ -139,10 +160,12 @@ pub mod images;
 pub mod items;
 pub mod lights;
 pub mod loot;
+pub mod maps;
 pub mod measure;
 pub mod place;
 pub mod quests;
 pub mod rehome;
+pub mod road;
 pub mod services;
 pub mod shading;
 pub mod spawn;
@@ -151,6 +174,7 @@ pub mod tables;
 pub mod terrain;
 pub mod textures;
 pub mod tiles;
+pub mod triggers;
 pub mod water;
 pub mod waypoints;
 pub mod wmos;
@@ -178,6 +202,9 @@ pub enum Tool {
     /// A ramp between two points, which the height brush cannot make — see
     /// [`grade`]. Two clicks and a button rather than a stroke.
     Grade,
+    /// A road along a run of points: the ground graded along it and its
+    /// textures painted — see [`road`].
+    Road,
     /// The shading brush: the colour painted onto the terrain's vertices —
     /// see [`shading`].
     Shading,
@@ -282,6 +309,20 @@ pub enum Tool {
     /// one says where it is. The server reads its copy from `area_template`
     /// at startup, so it is not available during a playtest.
     Zones,
+    /// `AreaTrigger.dbc`: the spheres and boxes the client reports standing
+    /// in, and what the server does when it is told — see [`triggers`].
+    ///
+    /// A client table whose rows are places, as `Light` is, so it keeps the
+    /// viewport and puts its form in the inspector. The server half is three
+    /// tables of vmangos' database, which the form reads when a connection is
+    /// set and leaves out when none is.
+    Triggers,
+    /// `WorldSafeLocs.dbc`: where a released spirit appears, and which zones
+    /// each place serves — see [`graveyards`].
+    ///
+    /// On `Tool::Triggers`' terms: the places are a client table picked in the
+    /// viewport, and the links to zones are rows of vmangos' database.
+    Graveyards,
     /// Any DBC table, by name — see [`tables`].
     ///
     /// The workspace's list is the files of `DBFilesClient\`. Choosing one
@@ -318,7 +359,7 @@ pub enum Surface {
 /// [`Tool::at`] enforces the list: an exhaustive `match` that does not compile
 /// until a new variant has an index, plus a test that this list is exactly
 /// those indices in order.
-pub const ALL: [Tool; 23] = [
+pub const ALL: [Tool; 26] = [
     Tool::Select,
     Tool::Terrain,
     Tool::Grade,
@@ -342,6 +383,9 @@ pub const ALL: [Tool; 23] = [
     Tool::ItemSets,
     Tool::Tables,
     Tool::Zones,
+    Tool::Triggers,
+    Tool::Graveyards,
+    Tool::Road,
 ];
 
 impl Tool {
@@ -377,6 +421,9 @@ impl Tool {
             Tool::ItemSets => 20,
             Tool::Tables => 21,
             Tool::Zones => 22,
+            Tool::Triggers => 23,
+            Tool::Graveyards => 24,
+            Tool::Road => 25,
         }
     }
 
@@ -395,6 +442,8 @@ impl Tool {
             Tool::Flightpaths => Some("TaxiNodes"),
             Tool::ItemSets => Some("ItemSet"),
             Tool::Zones => Some(tables::area::TABLE),
+            Tool::Triggers => Some(vale_edit::dbc::places::TRIGGERS),
+            Tool::Graveyards => Some(vale_edit::dbc::places::SAFE_LOCS),
             // No one table: the workspace starts on the list of them.
             Tool::Tables => Some(tables::ANY),
             _ => None,
@@ -476,9 +525,12 @@ impl Tool {
             // row and a game object's are each a place in the world, so each
             // is picked with the pointer and puts its form where every other
             // selection's numbers go.
-            Tool::Lights | Tool::Flightpaths | Tool::Creatures | Tool::GameObjects => {
-                Surface::Inspector
-            }
+            Tool::Lights
+            | Tool::Flightpaths
+            | Tool::Triggers
+            | Tool::Graveyards
+            | Tool::Creatures
+            | Tool::GameObjects => Surface::Inspector,
             _ => Surface::World,
         }
     }
@@ -508,6 +560,8 @@ impl Tool {
             Tool::Flightpaths => &tables::TAXI_TABS,
             Tool::ItemSets => &tables::SET_TABS,
             Tool::Zones => &tables::ZONE_TABS,
+            Tool::Triggers => &tables::TRIGGER_TABS,
+            Tool::Graveyards => &tables::SAFE_LOC_TABS,
             _ => &[],
         }
     }
@@ -556,6 +610,7 @@ impl Tool {
             Tool::Select => "Select",
             Tool::Terrain => "Terrain",
             Tool::Grade => "Grade",
+            Tool::Road => "Road",
             Tool::Shading => "Shading",
             Tool::Textures => "Textures",
             Tool::Holes => "Holes",
@@ -589,14 +644,44 @@ impl Tool {
             // sub-areas are. Two subjects with one name would be two answers
             // to `--tool areas`.
             Tool::Zones => "Zones",
+            Tool::Triggers => "Triggers",
+            Tool::Graveyards => "Graveyards",
         }
     }
 }
 
-/// How many tiles are parsed a frame. One: a tile is about two megabytes, and
-/// parsing nine on the frame a map opens is a visible stall, while one a frame
-/// spreads the same work over nine frames with no visible stall.
-const OPEN_BUDGET: usize = 1;
+/// How many tiles are read and parsed on the task pool at once. Bevy's
+/// async-compute pool has four threads and the renderer's own tile loads share
+/// it, so two keeps the editor's reads from queueing the renderer's behind
+/// them.
+const OPEN_IN_FLIGHT: usize = 2;
+
+/// The tiles being read and parsed off the main thread for the session. See
+/// [`open_tiles`].
+#[derive(Resource, Default)]
+pub struct Opening {
+    tasks: Vec<OpeningTile>,
+    /// Claimed tiles that could not be read or parsed, by map, so they are
+    /// not asked for again every frame. The reason is in the status line.
+    failed: std::collections::HashSet<(String, (u32, u32))>,
+}
+
+/// One tile being read.
+struct OpeningTile {
+    coord: (u32, u32),
+    /// The map and the project it was asked for. A tile that lands after
+    /// either has changed is dropped.
+    map: String,
+    project: std::path::PathBuf,
+    task: bevy::tasks::Task<Result<vale_edit::adt::AdtFile, String>>,
+}
+
+impl Opening {
+    /// Whether a tile is being read.
+    pub fn is_opening(&self, coord: (u32, u32)) -> bool {
+        self.tasks.iter().any(|t| t.coord == coord)
+    }
+}
 
 /// Close the open tiles the focus has moved away from.
 ///
@@ -661,7 +746,9 @@ pub struct ToolPlugin;
 impl Plugin for ToolPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Tool>()
+            .init_resource::<Opening>()
             .add_systems(Update, (open_tiles, close_tiles, modes).chain())
+            .add_systems(Update, (maps::follow_map_table, maps::read_edited_map))
             .add_systems(Update, release_held);
         app.add_plugins((
             terrain::TerrainToolPlugin,
@@ -676,11 +763,13 @@ impl Plugin for ToolPlugin {
             place::PlaceToolPlugin,
             sweep::SweepPlugin,
             gizmo::GizmoToolPlugin,
-            grade::GradeToolPlugin,
+            // The two point-and-apply terrain tools as one entry, which keeps
+            // the tuple within what `add_plugins` accepts.
+            (grade::GradeToolPlugin, road::RoadToolPlugin),
             tables::TableToolPlugin,
             tiles::TilePlugin,
         ));
-        // A second call, because `add_plugins` takes at most sixteen. The
+        // A second call, because `add_plugins` takes at most fifteen. The
         // first tuple is full; further tool plugins go in this one.
         app.add_plugins((
             creatures::CreatureToolPlugin,
@@ -689,12 +778,22 @@ impl Plugin for ToolPlugin {
             items::ItemToolPlugin,
             quests::QuestToolPlugin,
             loot::LootToolPlugin,
-            behaviour::BehaviourToolPlugin,
+            // Behaviour, conditions and gossip as one entry, which keeps the
+            // tuple within what `add_plugins` accepts: three windows over the
+            // server's rows that open from any form.
+            (
+                behaviour::BehaviourToolPlugin,
+                conditions::ConditionToolPlugin,
+                gossip::GossipToolPlugin,
+            ),
             services::ServicesToolPlugin,
             spawn::SpawnKeysPlugin,
             group::GroupPlugin,
             measure::MeasureToolPlugin,
             flightpaths::FlightpathToolPlugin,
+            // The two place tools as one entry, which keeps the tuple within
+            // what `add_plugins` accepts.
+            (triggers::TriggerToolPlugin, graveyards::GraveyardToolPlugin),
             chunks::ChunkToolPlugin,
             guides::GuidesPlugin,
         ));
@@ -716,7 +815,8 @@ fn release_held(mut session: Option<ResMut<EditSession>>, buttons: Res<ButtonInp
     }
 }
 
-/// Parse the tiles around the focus, one a frame.
+/// Open the tiles around the focus: read and parse each on the task pool, and
+/// put it in the session when it is ready.
 ///
 /// It opens the block that is drawn, not only the tile under the pointer,
 /// because the pointer cannot pick against a tile that is not open and a
@@ -725,26 +825,69 @@ fn release_held(mut session: Option<ResMut<EditSession>>, buttons: Res<ButtonInp
 /// puts on screen, so the editable area and the visible area are the same:
 /// otherwise a tool would refuse edits on drawn ground the person can see.
 ///
-/// Tiles are opened nearest first. A 3x3 reach does not need the ordering; a
-/// 7x7 reach does. One tile is parsed a frame ([`OPEN_BUDGET`]), so at 49 tiles a row-major
-/// walk spends its first half-second on the corners while the ground under
-/// the pointer is still unopened, and until it is opened the pointer reports
-/// no ground and the brush does nothing.
+/// ## Off the main thread
+///
+/// A tile is a 10 to 35 ms archive read and a 5 to 10 ms parse. This used to
+/// open one tile a frame on the main thread, through the main archive chain
+/// and under its lock, so every frame of a block filling (49 tiles after a
+/// jump) was a long frame. The read is now on a chain borrowed from the pool
+/// with the editor's overlay set, as `render::terrain::read_tile`'s is, and
+/// the parse runs on the same task; the main thread only moves the finished
+/// `AdtFile` into the session.
+///
+/// Only the tiles the WDT claims are asked for, which is every tile the map
+/// has. A claimed tile that fails is remembered in [`Opening::failed`] and not
+/// asked for again on that map.
+///
+/// Tiles are asked for nearest first. A 3x3 reach does not need the ordering;
+/// a 7x7 reach does: until the tile under the pointer is open, the pointer
+/// reports no ground and the brush does nothing.
 fn open_tiles(
     mut session: Option<ResMut<EditSession>>,
     assets: Res<GameAssets>,
     focus: Res<vale_client::render::focus::WorldFocus>,
     reach: Res<vale_client::render::terrain::TerrainReach>,
     state: Res<crate::playtest::Playtest>,
+    mut opening: ResMut<Opening>,
 ) {
     let Some(session) = session.as_mut() else {
         return;
     };
+    // The reads that have finished. Taken whether or not the focus is
+    // present, so a task never outlives the need for it by more than a frame.
+    let mut index = 0;
+    while index < opening.tasks.len() {
+        let done = bevy::tasks::block_on(bevy::tasks::futures_lite::future::poll_once(
+            &mut opening.tasks[index].task,
+        ));
+        let Some(result) = done else {
+            index += 1;
+            continue;
+        };
+        let pending = opening.tasks.swap_remove(index);
+        let current = pending.map == session.map && pending.project == session.project.root;
+        match result {
+            Ok(tile) if current => session.insert_opened(pending.coord, tile),
+            Ok(_) => {}
+            Err(why) => {
+                if current {
+                    session.status = why;
+                }
+                opening.failed.insert((pending.map, pending.coord));
+            }
+        }
+    }
+
     // Not during a playtest. The focus follows the character then, so this
     // would parse two megabytes a frame along the character's route, for
     // tiles no tool may touch, and hold every one of them for the rest of the
     // session.
     if !focus.present || !state.editing() {
+        return;
+    }
+    // The claims are read for the open map when it opens; until they are,
+    // nothing is known to exist.
+    if session.claims_for != session.map {
         return;
     }
     let (cx, cy) = vale_assets::tile_for_position(focus.position.x, focus.position.y);
@@ -757,26 +900,49 @@ fn open_tiles(
                 continue;
             }
             let coord = (x as u32, y as u32);
-            if session.tiles.contains_key(&coord) {
+            if session.tiles.contains_key(&coord)
+                || !session.wdt_claims(coord)
+                || opening.is_opening(coord)
+                || opening.failed.contains(&(session.map.clone(), coord))
+            {
                 continue;
             }
             wanted.push((dx * dx + dy * dy, coord));
         }
     }
     wanted.sort_unstable_by_key(|(distance, _)| *distance);
-    let mut opened = 0;
+    // `VALE_OPEN_INLINE=1`: the old path, one tile a frame read and parsed on
+    // this thread, kept as a measurement probe so the two can be compared in
+    // one binary with `--tour`.
+    static INLINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *INLINE.get_or_init(|| std::env::var_os("VALE_OPEN_INLINE").is_some()) {
+        if let Some((_, coord)) = wanted.first() {
+            if !session.open(&assets, *coord) {
+                opening.failed.insert((session.map.clone(), *coord));
+            }
+        }
+        return;
+    }
     for (_, coord) in wanted {
-        if opened >= OPEN_BUDGET {
+        if opening.tasks.len() >= OPEN_IN_FLIGHT {
             return;
         }
-        // A coordinate the map does not have is asked for once a frame for
-        // as long as the camera is over it. That is one archive miss, which
-        // is a hash lookup in each of nineteen archives. The alternative, a
-        // second set that remembers the absences, is not used because the
-        // cost of the miss has not been measured as significant.
-        if session.open(&assets, coord) {
-            opened += 1;
-        }
+        let chains = assets.chains();
+        let dir = assets.gamedata_dir.clone();
+        let overlay = assets.overlay();
+        let path = session.key(coord).vpath();
+        let task = bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+            let mut chain = chains.take(&dir).map_err(|e| format!("{path}: {e}"))?;
+            chain.set_overlay(overlay);
+            let bytes = chain.read(&path).map_err(|e| format!("{path}: {e}"))?;
+            vale_edit::adt::AdtFile::parse(&bytes).map_err(|e| format!("{path}: {e}"))
+        });
+        opening.tasks.push(OpeningTile {
+            coord,
+            map: session.map.clone(),
+            project: session.project.root.clone(),
+            task,
+        });
     }
 }
 
@@ -1043,6 +1209,7 @@ fn modes(
         // item, quest and flight path tools: the number row picks a brush
         // mode, and a row of a table has none.
         Tool::Grade
+        | Tool::Road
         | Tool::Creatures
         | Tool::GameObjects
         | Tool::Items
@@ -1050,6 +1217,8 @@ fn modes(
         | Tool::Quests
         | Tool::Tables
         | Tool::Zones
+        | Tool::Triggers
+        | Tool::Graveyards
         | Tool::Flightpaths => {}
         Tool::Terrain => {
             // Unshifted digits cover the two long rows; shifted digits cover

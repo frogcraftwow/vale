@@ -53,6 +53,7 @@
 //! is the row most worth editing: it is what the whole map is lit by.
 
 use super::Tool;
+use crate::marks::{Look, Marks};
 use crate::session::EditSession;
 use vale_assets::tables::light::{light_field as lf, YARDS_PER_UNIT};
 use vale_client::render::axes;
@@ -106,6 +107,59 @@ pub struct Lights {
     pub fly_to: Option<Vec3>,
     /// What the left button is moving, if anything — see [`Drag`].
     pub drag: Option<Drag>,
+    /// Whether a click on the ground makes a light there. See [`new_light`].
+    pub armed: bool,
+}
+
+/// The radii a new light is made with, in yards: full strength within the
+/// first, faded out by the second.
+pub const NEW_RADII: (f32, f32) = (50.0, 120.0);
+
+impl Lights {
+    /// The map's default light, if the open map has one.
+    pub fn default_light(&self) -> Option<&Mark> {
+        self.marks.iter().find(|mark| mark.everywhere)
+    }
+
+    /// The light a new one copies its weather from: the chosen light, else the
+    /// map's default light, else any light on the map.
+    pub fn template(&self) -> Option<&Mark> {
+        self.selected
+            .and_then(|id| self.marks.iter().find(|mark| mark.id == id))
+            .or_else(|| self.default_light())
+            .or_else(|| self.marks.first())
+    }
+}
+
+/// Make a light on `map`, at `centre` or as the map's default light with
+/// `None`, lit like [`Lights::template`] (or, on a map with no light, like
+/// light 1, Eastern Kingdoms' default). Select it and open its row. Answers
+/// the status line.
+pub fn new_light(
+    session: &mut EditSession,
+    lights: &mut Lights,
+    browser: &mut super::tables::Browser,
+    map: u32,
+    centre: Option<Vec3>,
+) -> String {
+    let (template, like) = match lights.template() {
+        Some(mark) => (Some(mark.record), mark.id),
+        None => (session.table("Light").and_then(|table| table.row_of(1)), 1),
+    };
+    let Some(record) = super::tables::add_light(session, map, centre.map(|at| at.to_array()), NEW_RADII, template) else {
+        return "Light.dbc is not open".to_string();
+    };
+    let Some(id) = session.table("Light").and_then(|table| table.u32_at(record, 0)) else {
+        return "the new light has no id".to_string();
+    };
+    lights.selected = Some(id);
+    lights.armed = false;
+    browser.look_at("Light");
+    browser.follow(session, "Light", id);
+    match centre {
+        Some(_) => format!("created light {id} on map {map} with the settings of light {like}"),
+        None => format!("created light {id} as the default light of map {map}"),
+    }
 }
 
 /// **What a held left button is moving.**
@@ -180,7 +234,7 @@ impl Plugin for LightToolPlugin {
             Update,
             // **After the pick, like every tool here**: reading the pointer
             // before this frame's ray is built aims at where the pointer was.
-            (collect, aim, press, drag).chain().after(crate::pick::aim),
+            (collect, aim, press, drag, disarm).chain().after(crate::pick::aim),
         )
         // …and the drawing after the picking, so the ring that lights up under
         // the pointer does so on the frame the pointer reached it.
@@ -395,14 +449,32 @@ fn aim(
         .map(|(_, what)| (mark.id, what));
 }
 
+/// Escape disarms New light.
+fn disarm(
+    mut lights: ResMut<Lights>,
+    keys: Res<ButtonInput<KeyCode>>,
+    wants: Res<bevy_egui::input::EguiWantsInput>,
+    tool: Res<Tool>,
+) {
+    if *tool != Tool::Lights || wants.wants_keyboard_input() {
+        return;
+    }
+    if lights.armed && keys.just_pressed(KeyCode::Escape) {
+        lights.armed = false;
+    }
+}
+
 /// **Choose the light under the pointer, and open its row.**
 fn press(
     mut lights: ResMut<Lights>,
     buttons: Res<ButtonInput<MouseButton>>,
     tool: Res<Tool>,
     state: Res<crate::playtest::Playtest>,
-    session: Option<Res<EditSession>>,
+    mut session: Option<ResMut<EditSession>>,
     mut browser: Option<ResMut<super::tables::Browser>>,
+    cursor: Res<crate::pick::Cursor>,
+    focus: Res<WorldFocus>,
+    over: (Res<crate::ui::Viewport>, Res<bevy_egui::input::EguiWantsInput>, Query<&Window>),
 ) {
     if !state.editing() || *tool != Tool::Lights {
         return;
@@ -410,9 +482,22 @@ fn press(
     if !buttons.just_pressed(MouseButton::Left) {
         return;
     }
+    // Armed, a click on the ground makes a light there.
+    if lights.armed {
+        let (viewport, wants, windows) = over;
+        if !crate::ui::over_the_world(&viewport, &wants, &windows) {
+            return;
+        }
+        if let (Some(at), Some(session), Some(browser)) = (cursor.surface, session.as_mut(), browser.as_mut()) {
+            let line = new_light(session, &mut lights, browser, focus.map_id, Some(at));
+            session.status = line;
+        }
+        return;
+    }
     let Some((id, what)) = lights.hovered else {
         return;
     };
+    let session = session.as_deref();
     let already = lights.selected == Some(id);
     lights.selected = Some(id);
     // **The press that selects is also the press that starts a move.** One
@@ -463,10 +548,13 @@ fn press(
 /// Two rings per light, at the radii the row states: the inner one is where it
 /// stops applying at full strength and the outer is where it has faded out, and
 /// the pair is what a falloff *is*. Flat rings rather than spheres — a sphere
-/// wireframe at 700 yards is a ball of lines with the ground invisible inside
-/// it, and the question being asked is how far across the map the light reaches.
+/// at 700 yards surrounds the camera with the ground hidden inside it, and the
+/// question being asked is how far across the map the light reaches.
+///
+/// Everything here is [`Look::Ghosted`]: a light is a thing to aim at, and a
+/// ring behind a hill is still part of the falloff.
 fn draw(
-    mut gizmos: Gizmos<super::gizmo::EditorHandles>,
+    mut marks: ResMut<Marks>,
     lights: Res<Lights>,
     tool: Res<Tool>,
     state: Res<crate::playtest::Playtest>,
@@ -501,7 +589,7 @@ fn draw(
             (false, true) => Color::srgb(1.0, 1.0, 1.0),
             (false, false) => Color::srgb(0.95, 0.72, 0.30),
         };
-        marker(&mut gizmos, mark.at, grab_radius(mark.at, eye), colour);
+        marker(&mut marks, mark.at, grab_radius(mark.at, eye), colour);
 
         // **The falloff belongs to the light that is being edited, and to
         // nothing else.** Drawn for all eighty it was a screen full of
@@ -545,8 +633,8 @@ fn draw(
         // orthographically, at one world unit to the window — see
         // `vale_client::render::present::PRESENT_LAYER`. A ring at world
         // z = 0 is Bevy y = 0, which that camera put on the centre row.
-        circle(&mut gizmos, mark.at, mark.start, Plane::Flat, inner);
-        circle(&mut gizmos, mark.at, mark.end, Plane::Flat, outer);
+        circle(&mut marks, mark.at, mark.start, inner);
+        circle(&mut marks, mark.at, mark.end, outer);
     }
 }
 
@@ -576,60 +664,26 @@ const MARKER_LARGEST: f32 = 22.0;
 
 /// **A light, as a thing standing in the world.**
 ///
-/// A small ball at the position with a line dropping under it. The ball is the
+/// A ball at the position with a line dropping under it. The ball is the
 /// same size on screen wherever it is, like a doodad's handle; the drop is what
 /// gives it a height, and without it a light in the air and a light on the
 /// ground are the same two pixels.
-fn marker(gizmos: &mut Gizmos<super::gizmo::EditorHandles>, at: Vec3, radius: f32, colour: Color) {
-    sphere(gizmos, at, radius, colour);
-    let foot = Vec3::from(axes::to_bevy([at.x, at.y, at.z - DROP]));
+fn marker(marks: &mut Marks, at: Vec3, radius: f32, colour: Color) {
     let head = Vec3::from(axes::to_bevy(at.to_array()));
+    marks.sphere(head, radius, colour, Look::Ghosted);
+    let foot = Vec3::from(axes::to_bevy([at.x, at.y, at.z - DROP]));
     // Dimmer than the ball: the drop says where the light is *over*, and it
     // should not compete with the thing it is pointing at.
-    gizmos.line(foot, head, colour.with_alpha(0.55));
+    marks.line(foot, head, colour.with_alpha(0.55), Look::Ghosted);
 }
 
-/// Three great circles, one in each axis plane, in the world's own axes.
+/// One flat circle at the light's height, in the world's own axes.
 ///
-/// It reads as a ball from any angle, which one circle does not: seen edge-on a
-/// single circle is a straight line, and that is what put a bar across the
-/// window when every light was drawn as one.
-///
-/// Three great circles, one in each axis plane.
-///
-/// **Only for the marker, whose radius is a handful of yards.** A falloff is
-/// drawn as a silhouette and a footprint — see [`draw`], which says why three
-/// axis-aligned circles are the wrong shape at that size.
-fn sphere(gizmos: &mut Gizmos<super::gizmo::EditorHandles>, at: Vec3, radius: f32, colour: Color) {
-    for plane in [Plane::Flat, Plane::NorthUp, Plane::EastUp] {
-        circle(gizmos, at, radius, plane, colour);
-    }
-}
-
-/// Which two of the world's axes a circle varies in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Plane {
-    /// Horizontal — the one a drag moves in, and the one a falloff is measured
-    /// in on the ground.
-    Flat,
-    NorthUp,
-    EastUp,
-}
-
-/// One circle, in the world's own axes.
-///
-/// Drawn as a run of segments rather than with `Gizmos::circle`, because that
-/// one takes an isometry in Bevy's axes and the rotation to get a circle lying
-/// in a chosen plane of *this* world out of it is the kind of conversion this
-/// crate has paid for twice. A circle is 48 lines; the arithmetic is not worth
-/// the risk.
-fn circle(
-    gizmos: &mut Gizmos<super::gizmo::EditorHandles>,
-    at: Vec3,
-    radius: f32,
-    plane: Plane,
-    colour: Color,
-) {
+/// Drawn as a run of segments, each [`Marks::line`] thick at its own distance,
+/// rather than as one ring of a single thickness: a falloff is up to 2,648
+/// yards across, and a thickness right for the near side is a thread or a bar
+/// on the far side.
+fn circle(marks: &mut Marks, at: Vec3, radius: f32, colour: Color) {
     // **`is_finite` as well as positive.** A NaN fails every comparison, so
     // `radius <= 0.0` alone lets one through and every point of the circle
     // becomes NaN — which is a line drawn somewhere undefined rather than no
@@ -640,22 +694,9 @@ fn circle(
     let point = |n: usize| {
         let angle = n as f32 / RING_SEGMENTS as f32 * std::f32::consts::TAU;
         let (a, b) = (radius * angle.cos(), radius * angle.sin());
-        match plane {
-            Plane::Flat => Vec3::new(at.x + a, at.y + b, at.z),
-            Plane::NorthUp => Vec3::new(at.x + a, at.y, at.z + b),
-            Plane::EastUp => Vec3::new(at.x, at.y + a, at.z + b),
-        }
+        Vec3::from(axes::to_bevy([at.x + a, at.y + b, at.z]))
     };
-    let mut last = point(0);
-    for n in 1..=RING_SEGMENTS {
-        let next = point(n);
-        gizmos.line(
-            Vec3::from(axes::to_bevy(last.to_array())),
-            Vec3::from(axes::to_bevy(next.to_array())),
-            colour,
-        );
-        last = next;
-    }
+    marks.line_strip((0..=RING_SEGMENTS).map(point), colour, Look::Ghosted);
 }
 
 /// **Move the light under a held button, and write it as one undo entry.**

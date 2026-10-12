@@ -41,6 +41,7 @@ pub fn draw(ui: &mut egui::Ui, subject: Subject<'_>) {
     }
 
     summary(ui, flights);
+    flight_map_block(ui, session, flights, assets);
     ui.add_space(4.0);
     controls(ui, flights);
 
@@ -48,9 +49,9 @@ pub fn draw(ui: &mut egui::Ui, subject: Subject<'_>) {
         .id_salt("flightpaths")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            // Each selected thing is a section that folds, so a node with
-            // its paths, a path and a point together do not run the panel
-            // off the screen.
+            // Each selection (node, path, point) is a section that folds, so
+            // a node with its paths, a path and a point together do not run
+            // the panel off the screen.
             if let Some(id) = flights.node {
                 section(ui, &format!("Node {id}"), "node", |ui| {
                     node_block(ui, session, flights, id, now);
@@ -85,7 +86,7 @@ pub fn draw(ui: &mut egui::Ui, subject: Subject<'_>) {
                 .on_hover_text(
                     "Opens the Server panel. Apply in its Client tables block writes the \
                      nodes as taxi_nodes rows and copies TaxiPath.dbc and TaxiPathNode.dbc \
-                     into DataDir\\5875\\dbc; Put back restores the server's own.",
+                     into DataDir\\5875\\dbc; Restore copies the server's original files back.",
                 )
                 .clicked()
             {
@@ -129,7 +130,7 @@ fn summary(ui: &mut egui::Ui, flights: &Flightpaths) {
     }
     ui.label(
         egui::RichText::new(format!(
-            "{} problem(s) the server's loader would meet:",
+            "{} problem(s) the server would report on load:",
             flights.findings.len()
         ))
         .color(theme::WARN),
@@ -140,6 +141,93 @@ fn summary(ui: &mut egui::Ui, flights: &Flightpaths) {
                 .size(theme::SMALL)
                 .color(theme::WARN),
         );
+    }
+}
+
+/// Whether the client opens a flight map on this map, and the buttons that
+/// give it one, fit it to the nodes, and draw its picture again.
+fn flight_map_block(
+    ui: &mut egui::Ui,
+    session: &mut EditSession,
+    flights: &mut Flightpaths,
+    assets: &vale_client::assets::GameAssets,
+) {
+    use vale_edit::flightmap;
+    for table in [flightmap::TABLE, flightpaths::WORLD_MAP_AREA] {
+        if !session.open_table(assets, table) {
+            theme::note(ui, format!("opening {table}.dbc\u{2026}"));
+            return;
+        }
+    }
+    let Some(state) = flightpaths::flight_map(session, flights) else {
+        return;
+    };
+    let mut make = false;
+    let mut redraw: Option<flightmap::FlightMap> = None;
+    match &state {
+        flightpaths::FlightMap::Shipped => {}
+        flightpaths::FlightMap::Missing => {
+            if !flights.nodes.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "The 1.12.1 client opens no flight map on this map: WorldMapContinent.dbc has \
+                         no row for map {}, so speaking to a flight master here does nothing.",
+                        flights.map
+                    ))
+                    .size(theme::SMALL)
+                    .color(theme::WARN),
+                );
+            }
+            make = ui
+                .button("Create flight map")
+                .on_hover_text(
+                    "Add a WorldMapContinent.dbc row for this map, with a square box over its tiles \
+                     and nodes, and draw Interface\\TaxiFrame\\TAXIMAP<map>.blp from its minimap \
+                     tiles. Client only: the server reads neither.",
+                )
+                .clicked();
+        }
+        flightpaths::FlightMap::Made { flight, outside } => {
+            let side = flight.taxi_box[2] - flight.taxi_box[0];
+            theme::note(ui, format!("Flight map: {side:.0} yards square."));
+            if !outside.is_empty() {
+                let ids: Vec<String> = outside.iter().map(u32::to_string).collect();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Node(s) {} are outside the flight map's box; the client does not draw them.",
+                        ids.join(", ")
+                    ))
+                    .size(theme::SMALL)
+                    .color(theme::WARN),
+                );
+            }
+            if !flightpaths::has_picture(assets, flights) {
+                ui.label(
+                    egui::RichText::new("The flight map has no TAXIMAP<map>.blp image; the client draws the nodes on a blank background.")
+                        .size(theme::SMALL)
+                        .color(theme::WARN),
+                );
+            }
+            ui.horizontal_wrapped(|ui| {
+                make = ui
+                    .button("Refit flight map")
+                    .on_hover_text("Resets the box to cover this map's tiles and nodes, and redraws TAXIMAP<map>.blp.")
+                    .clicked();
+                if ui
+                    .button("Redraw flight map image")
+                    .on_hover_text("Redraws TAXIMAP<map>.blp from the current minimap tiles, with the same box.")
+                    .clicked()
+                {
+                    redraw = Some(*flight);
+                }
+            });
+        }
+    }
+    if make {
+        session.status = flightpaths::make_flight_map(session, assets, flights);
+    }
+    if let Some(flight) = redraw {
+        session.status = flightpaths::draw_flight_map(session, assets, flights, &flight);
     }
 }
 
@@ -212,7 +300,7 @@ fn controls(ui: &mut egui::Ui, flights: &mut Flightpaths) {
     });
     ui.checkbox(&mut flights.draw_by_hand, "Draw points by hand")
         .on_hover_text(
-            "Connect places no points of its own. Each click on the ground places the \
+            "Connect places no points automatically. Each click on the ground places the \
              next point at the draft height; Ctrl + drag from a spot places it at the \
              height the drag sets; a click on the far node makes the path.",
         );
@@ -235,9 +323,9 @@ fn controls(ui: &mut egui::Ui, flights: &mut Flightpaths) {
             ),
         );
     }
-    ui.checkbox(&mut flights.with_return, "Make the path back")
+    ui.checkbox(&mut flights.with_return, "Create return path")
         .on_hover_text(
-            "Connect makes the reverse path as well: the same points in the other \
+            "Connect also creates the return path: the same points in the opposite \
              order. 270 of the 275 shipped flights have one, as a row of its own.",
         );
     ui.checkbox(&mut flights.carry_ends, "Move path ends with a node")
@@ -338,7 +426,7 @@ fn node_block(
             flights.fly_to(node.at);
         }
         if ui
-            .button("Drop to the ground")
+            .button("Snap to ground")
             .on_hover_text("Set z to the ground under the node, where the ground is open.")
             .clicked()
         {
@@ -371,12 +459,12 @@ fn node_block(
     let leaving: Vec<Route> = leaving.into_iter().cloned().collect();
     let arriving: Vec<Route> = arriving.into_iter().cloned().collect();
     ui.add_space(4.0);
-    theme::heading(ui, &format!("Paths from here ({})", leaving.len()));
+    theme::heading(ui, &format!("Outgoing paths ({})", leaving.len()));
     for route in &leaving {
         let back = arriving.iter().any(|other| other.path.from == route.path.to);
         route_row(ui, flights, route, route.path.to, "\u{2192}", back);
     }
-    theme::heading(ui, &format!("Paths to here ({})", arriving.len()));
+    theme::heading(ui, &format!("Incoming paths ({})", arriving.len()));
     for route in &arriving {
         let back = leaving.iter().any(|other| other.path.to == route.path.from);
         route_row(ui, flights, route, route.path.from, "\u{2190}", back);
@@ -434,7 +522,7 @@ fn route_row(
         route.points.len(),
         match back {
             true => "",
-            false => ". There is no path the other way.",
+            false => ". No return path.",
         }
     ));
     if response.clicked() {
@@ -442,7 +530,7 @@ fn route_row(
     }
     if !back {
         ui.label(
-            egui::RichText::new("   no path back")
+            egui::RichText::new("   no return path")
                 .size(theme::SMALL)
                 .color(theme::WARN),
         );
@@ -502,7 +590,7 @@ fn path_block(
         if ui
             .button("Fly to")
             .on_hover_text(
-                "Frames the whole path. From that far back the world's fog can hide                  the ground; FOG on the view bar turns it off.",
+                "Frames the whole path. From that far back the world's fog can hide the ground; FOG on the view bar turns it off.",
             )
             .clicked()
         {
@@ -513,15 +601,15 @@ fn path_block(
             .iter()
             .any(|other| other.path.from == route.path.to && other.path.to == route.path.from);
         if ui
-            .add_enabled(!has_back, egui::Button::new("Make the path back"))
-            .on_hover_text("A new path the other way through the same points, at the same cost.")
-            .on_disabled_hover_text("There is already a path the other way.")
+            .add_enabled(!has_back, egui::Button::new("Create return path"))
+            .on_hover_text("Creates a path in the opposite direction through the same points, at the same cost.")
+            .on_disabled_hover_text("A return path already exists.")
             .clicked()
         {
             match taxi::reverse_path(&mut session.tables, id) {
                 Ok(done) => {
                     let made = done.made;
-                    flightpaths::record(session, "Make the path back", done);
+                    flightpaths::record(session, "Create return path", done);
                     session.status = format!("path {} made", made.unwrap_or(0));
                     flights.path = made;
                     flights.point = None;
@@ -539,7 +627,7 @@ fn path_block(
         }
         if ui
             .button("Remove path")
-            .on_hover_text("Removes this path and its points. The path the other way is kept.")
+            .on_hover_text("Removes this path and its points. The return path is kept.")
             .clicked()
         {
             match taxi::remove_path(&mut session.tables, id) {
@@ -684,7 +772,7 @@ fn point_block(
         }
         if ui
             .add_enabled(route.points.len() > 2, egui::Button::new("Remove point"))
-            .on_hover_text("Delete. The later points move down by one.")
+            .on_hover_text("Removes this point. The index of each later point moves down by one.")
             .on_disabled_hover_text("A path needs at least two points.")
             .clicked()
         {
@@ -718,8 +806,8 @@ mod tests {
         };
         assert_eq!(sides(&node([0, 541])), "Offered to the Alliance.");
         assert_eq!(sides(&node([2224, 541])), "Offered to both sides.");
-        // Node 9's shape: the Alliance gryphon in the column vmangos reads as
-        // the Horde's.
+        // Node 9 has this pair: the Alliance gryphon in the column vmangos
+        // reads as the Horde's.
         assert_eq!(
             sides(&node([541, 0])),
             "The server offers it to the Horde; the client's flight map draws it for the Alliance."

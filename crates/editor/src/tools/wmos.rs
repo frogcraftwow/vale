@@ -41,6 +41,7 @@
 //! acceptable rather than a fallback of last resort.
 
 use crate::pick::Cursor;
+use crate::marks::{Look, Marks};
 use crate::session::EditSession;
 use crate::tools::Tool;
 use vale_client::render::axes;
@@ -153,7 +154,7 @@ impl Plugin for WmoToolPlugin {
                     // without telling the panel holding a copy of the record.
                     .after(super::shortcuts),
             )
-            .add_systems(Update, draw_marker);
+            .add_systems(Update, (draw_marker, draw_locked));
     }
 }
 
@@ -237,10 +238,45 @@ pub(crate) fn select(
     cursor: Res<Cursor>,
     // Tuples, because this system is past Bevy's limit of sixteen parameters.
     (gizmo, placing): (Res<super::gizmo::Gizmo>, Res<super::place::Placing>),
-    (keys, mut marquee): (Res<ButtonInput<KeyCode>>, ResMut<super::group::Marquee>),
+    (keys, mut marquee, mut menu): (
+        Res<ButtonInput<KeyCode>>,
+        ResMut<super::group::Marquee>,
+        ResMut<crate::context::ContextMenu>,
+    ),
 ) {
+    if *tool != Tool::Wmos || !state.editing() {
+        return;
+    }
+    // A right click: the building under the pointer, locked or not, for the
+    // menu, as the doodad pick does. See `crate::context`.
+    if menu.asked() {
+        let Some(session) = session else { return };
+        let hit = super::doodads::pointer_ray(&windows, &camera).and_then(|(origin, direction)| {
+            let boxed = super::doodads::boxes_hit(
+                parts.iter().filter_map(|(parent, at, aabb)| {
+                    let id = placements.get(parent.parent()).ok()?.unique_id;
+                    Some((id, at, aabb))
+                }),
+                origin,
+                direction,
+            );
+            solid_hit(&boxed, &session, &mut buildings, origin, direction)
+                .or_else(|| boxed.first().map(|&(_, unique_id, _)| unique_id))
+        });
+        menu.object = hit.map(|unique_id| {
+            let locked = session.placement_locked(super::place::Kind::Wmo, unique_id);
+            if !locked && !selection.holds(unique_id) {
+                if let Some(found) = find(&session, unique_id) {
+                    selection.only(Some(found));
+                    picked_primary(&mut held, &selection);
+                }
+            }
+            crate::context::Target::Wmo { unique_id, locked }
+        });
+        return;
+    }
     // A click that places must not also select — see [`super::place`].
-    if *tool != Tool::Wmos || !state.editing() || placing.armed() {
+    if placing.armed() {
         return;
     }
     if !buttons.just_pressed(MouseButton::Left) {
@@ -279,8 +315,10 @@ pub(crate) fn select(
         ray.origin,
         *ray.direction,
     );
+    // A locked building is not picked; see `crate::session::PlacementLocks`.
     let hit = solid_hit(&boxed, &session, &mut buildings, ray.origin, *ray.direction)
         .or_else(|| boxed.first().map(|&(_, unique_id, _)| unique_id))
+        .filter(|unique_id| !session.placement_locked(super::place::Kind::Wmo, *unique_id))
         .and_then(|unique_id| find(&session, unique_id));
     // The same four cases as the doodad pick — see `super::doodads::select`.
     let adding = super::group::shift(&keys);
@@ -350,7 +388,9 @@ fn enclose(
     for (coord, tile) in &session.tiles {
         let names = tile.building_names();
         for (index, record) in tile.building_list().iter().enumerate() {
-            if !shown.contains(&record.unique_id) {
+            if !shown.contains(&record.unique_id)
+                || session.placement_locked(super::place::Kind::Wmo, record.unique_id)
+            {
                 continue;
             }
             let world = vale_assets::world::adt::placement_to_world(record.position);
@@ -519,7 +559,9 @@ pub(crate) fn all_of(session: &EditSession, path: &str) -> Vec<Selected> {
         let names = tile.building_names();
         for (index, record) in tile.building_list().iter().enumerate() {
             let named = names.get(record.name_id as usize).cloned().unwrap_or_default();
-            if !named.eq_ignore_ascii_case(path) {
+            if !named.eq_ignore_ascii_case(path)
+                || session.placement_locked(super::place::Kind::Wmo, record.unique_id)
+            {
                 continue;
             }
             let world = vale_assets::world::adt::placement_to_world(record.position);
@@ -786,10 +828,10 @@ pub(crate) fn what_changed(was: &Building, now: &Building) -> (&'static str, &'s
         return ("Turn WMO", "rotation");
     }
     if was.doodad_set != now.doodad_set {
-        return ("Set WMO doodads", "doodadset");
+        return ("Set WMO doodad set", "doodadset");
     }
     if was.name_set != now.name_set {
-        return ("Set WMO names", "nameset");
+        return ("Set WMO name set", "nameset");
     }
     ("Edit WMO", "record")
 }
@@ -806,11 +848,16 @@ fn remove(
     state: Res<crate::playtest::Playtest>,
     keys: Res<ButtonInput<KeyCode>>,
     wants: Res<bevy_egui::input::EguiWantsInput>,
+    mut menu: ResMut<crate::context::ContextMenu>,
 ) {
-    if *tool != Tool::Wmos || !state.editing() || wants.wants_keyboard_input() {
+    if *tool != Tool::Wmos || !state.editing() {
         return;
     }
-    if !keys.just_pressed(KeyCode::Delete) {
+    // The Delete key, or the right-click menu's Delete.
+    let asked = menu
+        .take_request(|r| *r == crate::context::Request::Delete)
+        .is_some();
+    if !asked && (wants.wants_keyboard_input() || !keys.just_pressed(KeyCode::Delete)) {
         return;
     }
     let Some(session) = session.as_mut() else {
@@ -1320,22 +1367,92 @@ fn resync(mut selection: ResMut<Selection>, session: Option<Res<EditSession>>) {
     }
 }
 
-/// A box around whatever is selected.
+/// One box per building: the hull of its drawn parts' boxes, in the
+/// building's own frame, so it turns with the building.
 ///
-/// The drawn batches' boxes and not the `MODF` one, for the same reason the
-/// pick uses them: the `MODF` box is the axis-aligned hull of the whole
-/// cathedral, and a marker that size says nothing about which building it is
-/// around. The `MODF` box is drawn too, in a second colour, because it is a
-/// thing this tool edits and a thing that can be wrong.
+/// One box per part drew a selected house as a nest of thirty boxes, one for
+/// each group and batch. The hull says which building is selected, which is
+/// what the box is for. The `MODF` box is not drawn: it is the axis-aligned
+/// hull in the world's frame, larger than the building whenever the building
+/// is turned.
+fn building_boxes<'a>(
+    parts: impl Iterator<Item = (&'a ChildOf, &'a GlobalTransform, &'a Aabb)>,
+    placements: &Query<(&WmoPlacement, &GlobalTransform)>,
+    wanted: impl Fn(u32) -> bool,
+) -> Vec<(u32, Transform)> {
+    let mut hulls: Vec<(Entity, u32, GlobalTransform, Vec3, Vec3)> = Vec::new();
+    for (parent, transform, aabb) in parts {
+        let Ok((placement, frame)) = placements.get(parent.parent()) else {
+            continue;
+        };
+        if !wanted(placement.unique_id) {
+            continue;
+        }
+        let into_frame = frame.affine().inverse() * transform.affine();
+        let (centre, half) = (Vec3::from(aabb.center), Vec3::from(aabb.half_extents));
+        let at = match hulls.iter().position(|hull| hull.0 == parent.parent()) {
+            Some(at) => at,
+            None => {
+                hulls.push((parent.parent(), placement.unique_id, *frame, Vec3::MAX, Vec3::MIN));
+                hulls.len() - 1
+            }
+        };
+        let hull = &mut hulls[at];
+        for corner in 0..8 {
+            let sign = Vec3::new(
+                if corner & 1 == 0 { -1.0 } else { 1.0 },
+                if corner & 2 == 0 { -1.0 } else { 1.0 },
+                if corner & 4 == 0 { -1.0 } else { 1.0 },
+            );
+            let point = into_frame.transform_point3(centre + half * sign);
+            hull.3 = hull.3.min(point);
+            hull.4 = hull.4.max(point);
+        }
+    }
+    hulls
+        .into_iter()
+        .map(|(_, unique_id, frame, lower, upper)| {
+            let (scale, rotation, _) = frame.to_scale_rotation_translation();
+            let centre = frame.affine().transform_point3((lower + upper) * 0.5);
+            let pose = Transform::from_translation(centre)
+                .with_rotation(rotation)
+                .with_scale((upper - lower) * scale);
+            (unique_id, pose)
+        })
+        .collect()
+}
+
+/// Box every locked WMO in red while the tool is chosen. See
+/// `crate::session::PlacementLocks`.
+fn draw_locked(
+    mut marks: ResMut<Marks>,
+    session: Option<Res<EditSession>>,
+    tool: Res<Tool>,
+    parts: Query<(&ChildOf, &GlobalTransform, &Aabb), With<WmoPart>>,
+    placements: Query<(&WmoPlacement, &GlobalTransform)>,
+) {
+    if *tool != Tool::Wmos {
+        return;
+    }
+    let Some(session) = session else { return };
+    let locked = &session.placement_locks().wmos;
+    if locked.is_empty() {
+        return;
+    }
+    for (_, pose) in building_boxes(parts.iter(), &placements, |id| locked.contains(&id)) {
+        marks.box_edges(pose, super::doodads::LOCKED.with_alpha(0.5), Look::Ghosted);
+    }
+}
+
+/// A box around each selected building; see [`building_boxes`]. Ghosted, so a
+/// box inside a cathedral is still seen, faintly, through its walls. See
+/// `crate::marks`.
 fn draw_marker(
-    // In front of the world — see [`super::gizmo::EditorHandles`]. This is
-    // the case that made it necessary: a cathedral's box is drawn entirely
-    // inside the cathedral.
-    mut gizmos: Gizmos<super::gizmo::EditorHandles>,
+    mut marks: ResMut<Marks>,
     selection: Res<Selection>,
     tool: Res<Tool>,
     parts: Query<(&ChildOf, &GlobalTransform, &Aabb), With<WmoPart>>,
-    placements: Query<&WmoPlacement>,
+    placements: Query<(&WmoPlacement, &GlobalTransform)>,
 ) {
     if *tool != Tool::Wmos {
         return;
@@ -1348,37 +1465,14 @@ fn draw_marker(
     let member = Color::srgb(0.55, 0.75, 0.9).with_alpha(0.3);
     // Sorted and searched rather than hashed — see `super::doodads::draw_marker`.
     let others = super::group::sorted(selection.also.iter().map(|m| m.unique_id));
-    for (parent, transform, aabb) in &parts {
-        let Ok(placement) = placements.get(parent.parent()) else {
-            continue;
-        };
-        let colour = match placement.unique_id == at.unique_id {
+    let wanted = |id: u32| id == at.unique_id || super::group::holds(&others, id);
+    for (unique_id, pose) in building_boxes(parts.iter(), &placements, wanted) {
+        let colour = match unique_id == at.unique_id {
             true => colour,
-            false if super::group::holds(&others, placement.unique_id) => member,
-            false => continue,
+            false => member,
         };
-        let centre = transform.affine().transform_point3(Vec3::from(aabb.center));
-        let half = Vec3::from(aabb.half_extents) * transform.scale();
-        gizmos.cube(
-            Transform::from_translation(centre)
-                .with_rotation(transform.rotation())
-                .with_scale(half * 2.0),
-            colour,
-        );
+        marks.box_edges(pose, colour, Look::Ghosted);
     }
-
-    // …and the file's own box, which is what the mover reads.
-    let a = vale_assets::world::adt::placement_to_world(at.record.bounds_lower);
-    let b = vale_assets::world::adt::placement_to_world(at.record.bounds_upper);
-    let lower = Vec3::new(a[0].min(b[0]), a[1].min(b[1]), a[2].min(b[2]));
-    let upper = Vec3::new(a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2]));
-    let centre = (lower + upper) * 0.5;
-    let size = upper - lower;
-    gizmos.cube(
-        Transform::from_translation(axes::to_bevy(centre.to_array()))
-            .with_scale(Vec3::from(axes::to_wow(size)).abs()),
-        Color::srgb(1.0, 0.8, 0.3).with_alpha(0.35),
-    );
 }
 
 #[cfg(test)]

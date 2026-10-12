@@ -190,6 +190,8 @@ struct TileData {
     atlas: Image,
     /// Decoded ground textures, parallel to the ADT's texture list.
     textures: Vec<Option<Image>>,
+    /// …and that list, for [`TileGround`].
+    names: Vec<String>,
     /// The `MDDF` doodads this tile owns — see [`read_tile`] for what "owns"
     /// means, since a placement can appear in two tiles — each with whether
     /// its origin stands in the tile's baked `MCSH` shadow, sampled here
@@ -270,6 +272,110 @@ pub struct LiveEdits(pub bool);
 /// Present only under [`LiveEdits`].
 #[derive(Component, Debug)]
 pub struct GroundSources(pub Vec<u32>);
+
+/// A drawn tile's ground textures, one image per `MCLY` texture name in the
+/// file's order, and the names themselves.
+///
+/// Kept so that a host which gives a chunk a texture it did not carry can cut
+/// the tile's ground into groups again without reading the tile: the atlas
+/// ([`TileAlpha`]) and the tint ([`TileTint`]) are already on the tile, and
+/// these are the rest of what a group's material names. A host that adds a
+/// name appends its image here. Present only under [`LiveEdits`].
+#[derive(Component, Debug, Clone)]
+pub struct TileGround {
+    pub textures: Vec<Handle<Image>>,
+    pub names: Vec<String>,
+}
+
+/// Which draw group a ground entity is: a hash of its texture set, its
+/// scrolls and the tile vertices it holds.
+///
+/// Two cuttings of a tile give a group the same key exactly when it holds the
+/// same chunks with the same textures, so a host that cuts a tile again
+/// replaces only the groups whose keys changed and leaves the rest on the GPU
+/// as they are. See [`ground_groups`]. Present only under [`LiveEdits`].
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GroundKey(pub u64);
+
+impl GroundKey {
+    pub fn of(draw: &vale_assets::world::adt::TerrainDraw, sources: &[u32]) -> GroundKey {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        draw.textures.hash(&mut hasher);
+        for scroll in &draw.scrolls {
+            scroll.map(f32::to_bits).hash(&mut hasher);
+        }
+        sources.hash(&mut hasher);
+        GroundKey(hasher.finish())
+    }
+}
+
+/// A tile's ground cut into draw groups as the streamer cuts it under
+/// [`LiveEdits`]: each group's draw, its mesh, where its vertices came from and
+/// its key. For a host that has changed which textures a chunk carries; see
+/// [`GroundKey`].
+pub fn ground_groups(
+    adt: &Adt,
+) -> Vec<(vale_assets::world::adt::TerrainDraw, Mesh, GroundSources, GroundKey)> {
+    let mesh = adt.to_mesh();
+    mesh.draws
+        .iter()
+        .filter_map(|draw| {
+            let (group, sources) = group_mesh(&mesh, draw.index_start, draw.index_count, true)?;
+            let key = GroundKey::of(draw, &sources);
+            Some((draw.clone(), group, GroundSources(sources), key))
+        })
+        .collect()
+}
+
+/// One draw group's material: its textures out of the tile's list (a slot it
+/// names past the list takes the first texture), the tile's atlas and tint,
+/// and its scrolls. The streamer's own, and a host cutting a tile again uses
+/// it so that the two cannot differ.
+pub fn ground_material(
+    draw: &vale_assets::world::adt::TerrainDraw,
+    ground: &[Handle<Image>],
+    atlas: Handle<Image>,
+    tint: Handle<Image>,
+) -> TerrainMaterial {
+    let pick = |slot: usize| -> Handle<Image> {
+        draw.textures
+            .get(slot)
+            .and_then(|&i| ground.get(i as usize))
+            .cloned()
+            .unwrap_or_else(|| ground.first().cloned().unwrap_or_default())
+    };
+    TerrainMaterial {
+        params: TerrainParams {
+            layer_count: draw.textures.len().min(4) as u32,
+            repeat: TEXTURE_REPEAT,
+            // Off. See [`TerrainParams::tint`].
+            tint: 0.0,
+            // Off. See [`TerrainParams::guides`].
+            grid: TerrainParams::NO_GUIDES.0,
+            scroll_a: pair(&draw.scrolls, 0),
+            scroll_b: pair(&draw.scrolls, 2),
+            guides: TerrainParams::NO_GUIDES.1,
+        },
+        alpha: atlas,
+        tint,
+        layer0: pick(0),
+        layer1: pick(1),
+        layer2: pick(2),
+        layer3: pick(3),
+    }
+}
+
+/// One ground texture as an image, decoded as the streamer decodes it, its
+/// file read through `read`: the magenta stand-in when it cannot be read, as
+/// the streamer draws it. For a host that gives a tile a texture it did not
+/// carry; see [`TileGround`].
+pub fn ground_image(read: &mut dyn FnMut(&str) -> Option<Vec<u8>>, name: &str) -> Image {
+    match ground_texture(read, name) {
+        Some(texture) => texture.into_image(),
+        None => crate::render::models::missing_image(),
+    }
+}
 
 /// What colour the ground's sheen is this frame, as the `MeshTag` every
 /// ground draw carries.
@@ -703,6 +809,7 @@ impl Plugin for TerrainPlugin {
         embedded_asset!(app, "shaders/terrain.wgsl");
         app.add_plugins(MaterialPlugin::<TerrainMaterial>::default())
             .init_resource::<LoadedTiles>()
+            .init_resource::<RetiringTiles>()
             // Off, so the client pays nothing for it — see [`LiveEdits`].
             .init_resource::<LiveEdits>()
             // The 3x3, unless a host has already inserted its own — see
@@ -713,7 +820,7 @@ impl Plugin for TerrainPlugin {
                 // `light_sheen` after the spawner, so a group spawned this
                 // frame carries the hour's colour on the frame it appears
                 // rather than one frame of matte ground.
-                (request_tiles, receive_tiles, light_sheen).chain(),
+                (request_tiles, receive_tiles, light_sheen, despawn_retired).chain(),
             )
             // The two layers this pass draws, each switchable on its own — see
             // [`crate::render::tuning`]. Nothing else writes either one's
@@ -781,7 +888,102 @@ fn report(
     );
 }
 
+/// Tiles that have left the block and wait to be despawned, oldest first. See
+/// [`retire_tile`].
+#[derive(Resource, Default)]
+pub struct RetiringTiles(std::collections::VecDeque<Entity>);
+
+/// How many retired tiles are despawned a frame. See [`retire_tile`].
+const DESPAWNS_PER_FRAME: usize = 1;
+
+/// Take a tile out of the world now and despawn it later.
+///
+/// A tile is a hierarchy of thousands of entities: its ground groups, water,
+/// foliage, doodads and buildings. A jump in the editor drops a 7x7 block, and
+/// despawning all of it in one frame was up to 75 ms of command application on
+/// the main thread (`request_tiles`' commands, in a per-system census of a
+/// five-stop `--tour`). Here the tile loses its [`TerrainTile`] component,
+/// which every streaming pass keys on, so to all of them it is gone at once;
+/// it is hidden, so nothing of it is drawn; and [`despawn_retired`] despawns
+/// [`DESPAWNS_PER_FRAME`] such tiles a frame.
+fn retire_tile(commands: &mut Commands, retiring: &mut RetiringTiles, tile: Entity) {
+    commands
+        .entity(tile)
+        .remove::<TerrainTile>()
+        .insert(Visibility::Hidden);
+    retiring.0.push_back(tile);
+}
+
+/// Despawn the oldest retired tiles. See [`retire_tile`].
+fn despawn_retired(mut retiring: ResMut<RetiringTiles>, mut commands: Commands) {
+    if retiring.0.is_empty() {
+        return;
+    }
+    for _ in 0..DESPAWNS_PER_FRAME {
+        let Some(tile) = retiring.0.pop_front() else {
+            return;
+        };
+        if let Ok(mut entity) = commands.get_entity(tile) {
+            entity.despawn();
+        }
+    }
+}
+
+/// A tile's own ground meshes and alpha atlas, taken out of `Assets` before
+/// the tile is despawned so they can be freed on the task pool. See
+/// [`retire_tile_assets`].
+struct RetiredAssets {
+    meshes: Vec<Mesh>,
+    images: Vec<Image>,
+}
+
+/// Take a despawning tile's own ground meshes and alpha atlas out of
+/// `Assets`, when they have a main-world copy.
+///
+/// Under [`LiveEdits`] both keep their data in the main world (the editor
+/// writes into them), so despawning a tile left Bevy's `Assets::track_assets`
+/// to free them on the main thread in `PreUpdate`. A jump in the editor drops
+/// a 7x7 block at once, and that was a frame of up to 160 ms: every
+/// `track_assets` system holds the asset server's lock while it frees, so the
+/// others queue behind it. Taken out here, the handle drops later find nothing
+/// to free, and the data is freed on the task pool by [`drop_in_background`].
+///
+/// Only assets the tile owns alone are taken: the ground groups (one mesh
+/// each) and the atlas. Tileset textures are shared through a cache and have
+/// no main-world copy. Without [`LiveEdits`] none of these has a main-world
+/// copy either, and this finds nothing.
+fn retire_tile_assets(
+    tile: Entity,
+    children: &Query<&Children>,
+    grounds: &Query<&Mesh3d, With<TerrainGround>>,
+    atlases: &Query<&TileAlpha>,
+    meshes: &mut Assets<Mesh>,
+    images: &mut Assets<Image>,
+    into: &mut RetiredAssets,
+) {
+    if let Ok(atlas) = atlases.get(tile) {
+        into.images.extend(images.remove(atlas.0.id()));
+    }
+    let Ok(kids) = children.get(tile) else {
+        return;
+    };
+    for child in kids.iter() {
+        if let Ok(mesh) = grounds.get(child) {
+            into.meshes.extend(meshes.remove(mesh.0.id()));
+        }
+    }
+}
+
+/// Free what [`retire_tile_assets`] took, on the task pool.
+fn drop_in_background(retired: RetiredAssets) {
+    if retired.meshes.is_empty() && retired.images.is_empty() {
+        return;
+    }
+    AsyncComputeTaskPool::get().spawn(async move { drop(retired) }).detach();
+}
+
 /// Load the 3x3 around the character, and drop anything outside it.
+#[allow(clippy::too_many_arguments)]
 fn request_tiles(
     focus: Res<WorldFocus>,
     live: Res<LiveEdits>,
@@ -795,6 +997,16 @@ fn request_tiles(
     // the 3x3 below can never want, so without this exclusion the streamer
     // despawns it on the first frame and again every time one is spawned.
     tiles: Query<(Entity, &TerrainTile), Without<crate::render::globalwmo::GlobalWmo>>,
+    // What a despawning tile owns, for [`retire_tile_assets`], and the queue
+    // it is despawned from, for [`retire_tile`].
+    (children, grounds, atlases, mut meshes, mut images, mut retiring): (
+        Query<&Children>,
+        Query<&Mesh3d, With<TerrainGround>>,
+        Query<&TileAlpha>,
+        ResMut<Assets<Mesh>>,
+        ResMut<Assets<Image>>,
+        ResMut<RetiringTiles>,
+    ),
 ) {
     let _zone = crate::zone!(crate::ui::debug::spans::Slot::TerrainRequest);
     if !focus.present {
@@ -824,9 +1036,12 @@ fn request_tiles(
         loaded.ready.clear();
         loaded.building = None;
         loaded.present.clear();
+        let mut retired = RetiredAssets { meshes: Vec::new(), images: Vec::new() };
         for (entity, _) in &tiles {
-            commands.entity(entity).despawn();
+            retire_tile_assets(entity, &children, &grounds, &atlases, &mut meshes, &mut images, &mut retired);
+            retire_tile(&mut commands, &mut retiring, entity);
         }
+        drop_in_background(retired);
     }
     loaded.centre = Some((cx, cy));
 
@@ -846,12 +1061,15 @@ fn request_tiles(
     // which has already despawned all of them — asking twice in one frame is
     // Bevy's "despawning an entity that does not exist" warning.
     if !changed_map {
+        let mut retired = RetiredAssets { meshes: Vec::new(), images: Vec::new() };
         for (entity, tile) in &tiles {
             if !wanted.contains(&tile.coord) {
-                commands.entity(entity).despawn();
+                retire_tile_assets(entity, &children, &grounds, &atlases, &mut meshes, &mut images, &mut retired);
+                retire_tile(&mut commands, &mut retiring, entity);
                 loaded.present.remove(&tile.coord);
             }
         }
+        drop_in_background(retired);
         // …and the finished loads that walked out of range before their turn
         // came. The loop above cannot see them: a `ready` tile has no
         // entity yet, so without this it stays in `present`, is handed over
@@ -936,15 +1154,14 @@ fn request_tiles(
 /// it is the conservative side: a missing mask draws no sheen
 /// instead of the most sheen in the world.
 fn ground_texture(
-    archive: &mut vale_assets::Assets,
+    read: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
     name: &str,
 ) -> Option<crate::render::models::RawTexture> {
     let specular = vale_assets::world::adt::specular_texture(name);
-    if let Some(blp) = archive.read(&specular).ok().and_then(|raw| blp::decode_mipped(&raw).ok()) {
+    if let Some(blp) = read(&specular).and_then(|raw| blp::decode_mipped(&raw).ok()) {
         return Some(crate::render::models::RawTexture::from_blp(blp));
     }
-    let mut texture =
-        crate::render::models::RawTexture::from_blp(blp::decode_mipped(&archive.read(name).ok()?).ok()?);
+    let mut texture = crate::render::models::RawTexture::from_blp(blp::decode_mipped(&read(name)?).ok()?);
     for level in &mut texture.levels {
         for texel in level.chunks_exact_mut(4) {
             texel[3] = 0;
@@ -987,7 +1204,7 @@ fn read_tile(
             // through the model image builder, so the ground samples exactly
             // as a model does — because the chain concatenation is a memcpy the
             // main thread should not make.
-            Some(ground_texture(&mut archive, name)?.into_image())
+            Some(ground_texture(&mut |path: &str| archive.read(path).ok(), name)?.into_image())
         })
         .collect();
 
@@ -1052,6 +1269,7 @@ fn read_tile(
         groups,
         atlas: atlas_image(&adt.alpha_atlas(), live),
         textures,
+        names: adt.texture_names.clone(),
         doodads,
         wmos,
         liquids,
@@ -1178,6 +1396,7 @@ fn receive_tiles(
                 groups,
                 atlas,
                 textures,
+                names,
                 doodads,
                 wmos,
                 liquids,
@@ -1276,6 +1495,10 @@ fn receive_tiles(
                 commands.entity(tile).insert((
                     TileAlpha(atlas_handle.clone()),
                     TileTint(tint_handle.clone()),
+                    TileGround {
+                        textures: ground.clone(),
+                        names,
+                    },
                 ));
             }
 
@@ -1313,32 +1536,12 @@ fn receive_tiles(
             continue;
         }
         if let Some((draw, mesh, sources)) = build.groups.pop() {
-            let pick = |slot: usize| -> Handle<Image> {
-                draw.textures
-                    .get(slot)
-                    .and_then(|&i| build.ground.get(i as usize))
-                    .cloned()
-                    .unwrap_or_else(|| build.ground.first().cloned().unwrap_or_default())
-            };
-            let material = materials.add(TerrainMaterial {
-                params: TerrainParams {
-                    layer_count: draw.textures.len().min(4) as u32,
-                    repeat: TEXTURE_REPEAT,
-                    // Off. See [`TerrainParams::tint`].
-                    tint: 0.0,
-                    // Off. See [`TerrainParams::guides`].
-                    grid: TerrainParams::NO_GUIDES.0,
-                    scroll_a: pair(&draw.scrolls, 0),
-                    scroll_b: pair(&draw.scrolls, 2),
-                    guides: TerrainParams::NO_GUIDES.1,
-                },
-                alpha: build.atlas.clone(),
-                tint: build.tint.clone(),
-                layer0: pick(0),
-                layer1: pick(1),
-                layer2: pick(2),
-                layer3: pick(3),
-            });
+            let material = materials.add(ground_material(
+                &draw,
+                &build.ground,
+                build.atlas.clone(),
+                build.tint.clone(),
+            ));
             let bytes = mesh_bytes(&mesh);
             handed.bytes += bytes;
             handed.largest = handed.largest.max(bytes);
@@ -1356,7 +1559,9 @@ fn receive_tiles(
                 ))
                 .id();
             if !sources.is_empty() {
-                commands.entity(ground).insert(GroundSources(sources));
+                commands
+                    .entity(ground)
+                    .insert((GroundKey::of(&draw, &sources), GroundSources(sources)));
             }
             build.spawned_groups += 1;
             new_groups += 1;
@@ -1590,8 +1795,10 @@ fn group_mesh(
             // Positions and normals cross into Bevy's axes here — the only place
             // terrain geometry does. A change of basis is a rotation, so the
             // normals need the same treatment as the positions and no rescaling.
+            // A skirt vertex follows the edge vertex it hangs from; see
+            // `TerrainMesh::source_of`.
             if live {
-                sources.push(index);
+                sources.push(source.source_of(index));
             }
             positions.push(axes::to_bevy(source.positions[i]).to_array());
             normals.push(axes::to_bevy(source.normals[i]).to_array());
@@ -1798,6 +2005,7 @@ mod tests {
             draws: Vec::new(),
             centre: [0.0; 3],
             radius: 1.0,
+            skirt_sources: Vec::new(),
         }
     }
 
@@ -1984,6 +2192,7 @@ mod tests {
             draws: Vec::new(),
             centre: [0.0; 3],
             radius: 1.0,
+            skirt_sources: Vec::new(),
         }
     }
 

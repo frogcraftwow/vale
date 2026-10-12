@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! This spawn      one creature, at one place
-//! Its template    every creature of this kind, everywhere
+//! Its template    every spawn of this creature_template entry, everywhere
 //! ```
 //!
 //! Apart from drawing the columns, the panel exists to state that scope. A
@@ -18,8 +18,8 @@
 //! elite".
 //!
 //! The two rows are drawn in two places on the same split: the columns of the
-//! clicked spawn are in the sidebar, and the columns of its kind are behind a
-//! button. The sidebar carries the spawn's own 21 columns, which describe a
+//! clicked spawn are in the sidebar, and the columns of its template are behind
+//! a button. The sidebar carries the spawn's own 21 columns, which describe a
 //! place in the world shown by the viewport beside them. Above them are two
 //! folding sections and a row of buttons: Spawn (the selected spawn's guid,
 //! level, what it offers and what this project does to it), Creature (a
@@ -30,8 +30,8 @@
 //! [`template_window`] holds `creature_template`'s 78, in a window that can be
 //! dragged off the panel and left open while the pointer works in the world.
 //!
-//! The sidebar is also where the other things a creature has are opened from,
-//! and each is its own window for the same reason: waypoints are a path drawn
+//! The sidebar is also where a creature's rows in other tables are opened
+//! from, and each is its own window for the same reason: waypoints are a path drawn
 //! in the world and edited beside it, a quest list is a list, and a trainer's
 //! spells are another list. One panel holding all of them would be a single
 //! long scroll.
@@ -108,6 +108,9 @@ pub struct Subject<'a> {
     /// The Vendor and Trainer windows' state, for their two buttons. See
     /// `super::services::windows`.
     pub services: &'a mut crate::tools::services::Services,
+    /// The gossip window's state, for the Gossip button. See
+    /// `super::gossip::window`.
+    pub gossip: &'a mut crate::tools::gossip::Gossip,
     /// Where this machine's server is. The panel's sentences read it, and it
     /// decides whether there is anything to say.
     pub server: &'a crate::server::settings::ServerSettings,
@@ -224,7 +227,7 @@ fn panel(ui: &mut egui::Ui, subject: &mut Subject<'_>) {
         theme::note(
             ui,
             "Click a creature in the viewport to open it. The nearest ones are drawn as \
-             models; everything further out is a ring on the ground.",
+             models; everything further out is a dome.",
         );
         return;
     };
@@ -232,9 +235,30 @@ fn panel(ui: &mut egui::Ui, subject: &mut Subject<'_>) {
     if let Some(gizmo) = subject.gizmo.as_deref_mut() {
         handles(ui, gizmo);
     }
-    match group_line(ui, subject.creatures.also.len() + 1, "creatures") {
+    let asked = {
+        let creatures = &*subject.creatures;
+        let edits = Some(&subject.session.server_edits);
+        let member = |index: usize| {
+            let guid = match index {
+                0 => spawn.guid,
+                _ => creatures.also[index - 1],
+            };
+            super::members::Member {
+                id: guid,
+                label: creatures
+                    .edited(guid, edits)
+                    .map(|spawn| spawn.label())
+                    .unwrap_or_else(|| "not on this map".to_string()),
+                detail: format!("guid {guid}"),
+            }
+        };
+        group_line(ui, creatures.also.len() + 1, "creatures", member)
+    };
+    match asked {
         Some(GroupAsk::Only) => subject.creatures.also.clear(),
         Some(GroupAsk::Clear) => subject.creatures.select_only(None),
+        Some(GroupAsk::Primary(guid)) => subject.creatures.promote(guid),
+        Some(GroupAsk::Drop(guid)) => subject.creatures.also.retain(|&had| had != guid),
         None => {}
     }
     // The spawn's name, the two folding sections and the buttons stay in
@@ -280,14 +304,24 @@ pub(super) enum GroupAsk {
     Only,
     /// Drop the whole selection.
     Clear,
+    /// Make this member the primary, from the list of members.
+    Primary(u64),
+    /// Take this member out of the group, from the list of members.
+    Drop(u64),
 }
 
 /// The line over a spawn's form when several spawns are selected: how many,
-/// that the form is the primary's, and the two buttons that shrink the group.
-/// Nothing is drawn for one. See `crate::tools::group`.
+/// that the form is the primary's, the two buttons that shrink the group, and
+/// the list of members (`super::members`), of which `member(0)` is the
+/// primary. Nothing is drawn for one. See `crate::tools::group`.
 ///
 /// `pub(super)` because the game-object panel draws the same line.
-pub(super) fn group_line(ui: &mut egui::Ui, count: usize, noun: &str) -> Option<GroupAsk> {
+pub(super) fn group_line(
+    ui: &mut egui::Ui,
+    count: usize,
+    noun: &str,
+    member: impl Fn(usize) -> super::members::Member,
+) -> Option<GroupAsk> {
     if count < 2 {
         return None;
     }
@@ -300,13 +334,13 @@ pub(super) fn group_line(ui: &mut egui::Ui, count: usize, noun: &str) -> Option<
     );
     theme::note(
         ui,
-        "This form is the brighter one's. A drag, the handles, the keys and \
-         delete act on all of them.",
+        "The form shows the highlighted spawn. Dragging, the handles, the keys and \
+         delete act on every selected spawn.",
     );
     ui.horizontal(|ui| {
         if ui
-            .small_button("Only this one")
-            .on_hover_text("Keep this one and drop the rest.")
+            .small_button("Select primary only")
+            .on_hover_text("Keep the highlighted spawn selected and deselect the rest.")
             .clicked()
         {
             asked = Some(GroupAsk::Only);
@@ -316,6 +350,11 @@ pub(super) fn group_line(ui: &mut egui::Ui, count: usize, noun: &str) -> Option<
         }
     });
     theme::note(ui, "shift + click adds or removes one · drag on empty ground selects a rectangle");
+    match super::members::list(ui, noun, count, member) {
+        Some(super::members::Pick::Primary(guid)) => asked = Some(GroupAsk::Primary(guid)),
+        Some(super::members::Pick::Drop(guid)) => asked = Some(GroupAsk::Drop(guid)),
+        None => {}
+    }
     ui.add_space(4.0);
     asked
 }
@@ -334,7 +373,7 @@ fn controls(ui: &mut egui::Ui, subject: &mut Subject<'_>) {
                 // beside the ones that are, so they are counted here.
                 (false, mine) => {
                     format!(
-                        "{spawns} spawn(s) on this map and {mine} of this project's, {near} near"
+                        "{spawns} spawn(s) on this map and {mine} created by this project, {near} near"
                     )
                 }
             })
@@ -356,8 +395,8 @@ fn controls(ui: &mut egui::Ui, subject: &mut Subject<'_>) {
     ui.horizontal(|ui| {
         ui.checkbox(&mut subject.creatures.show_models, "Models")
             .on_hover_text(
-                "Draw the nearest spawns as the creatures they are. Off leaves the rings, \
-                 which are what everything past the budget gets anyway.",
+                "Draw the nearest spawns as creature models. Off, every spawn is drawn as a \
+                 ring, as spawns past the model limit already are.",
             );
         ui.add(
             egui::DragValue::new(&mut subject.creatures.model_budget)
@@ -366,15 +405,23 @@ fn controls(ui: &mut egui::Ui, subject: &mut Subject<'_>) {
                 .prefix("at most "),
         )
         .on_hover_text(
-            "How many models at once. The busiest tile on map 0 holds 288 spawns and the \
+            "The maximum number of models drawn at once. The busiest tile on map 0 holds 288 spawns and the \
              editor streams a 7x7 block, so drawing every one of them is several thousand \
              creatures.",
         );
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut subject.creatures.show_markers, "Markers")
+            .on_hover_text(
+                "Mark every spawn near the camera. Off, only the selected, hovered and \
+                 grouped spawns are marked, which saves frame time where many spawns are \
+                 near. Spawns can still be clicked.",
+            );
         ui.checkbox(&mut subject.creatures.show_services, "Services")
             .on_hover_text(
-                "Draw icons over each creature within 150 yards for what its npc_flags \
-                 offer: quests, a vendor list, training, a flight, an inn, a bank and the \
-                 rest. The hover card names them.",
+                "Draw an icon over each creature within 150 yards for each service its \
+                 npc_flags offer: quests, vendor, trainer, flight master, innkeeper, banker \
+                 and others. The hover card lists them.",
             );
     });
 }
@@ -388,14 +435,14 @@ fn nothing_to_show(ui: &mut egui::Ui, subject: &Subject<'_>) {
             theme::note(
                 ui,
                 "Creatures are rows in vmangos' database rather than files in the archives, \
-                 so this tool needs a connection. Server… on the top bar is where it is set.",
+                 so this tool needs a database connection. Set it in Server… on the top bar.",
             );
         }
         None if subject.creatures.reading() => {
             theme::waiting(ui, "reading\u{2026}");
         }
         None => {
-            theme::note(ui, "No creature stands on this map.");
+            theme::note(ui, "No creature spawns on this map.");
         }
     }
 }
@@ -462,8 +509,8 @@ fn edits_block(
     match (undoable, outstanding, plan.is_empty()) {
         (0, _, false) => theme::note(
             ui,
-            "Not applied. The database still holds what it did; what is drawn here is \
-             this project's own.",
+            "Not applied. The database still holds its previous values; the editor \
+             draws this project's values.",
         ),
         // Everything this project claims is in the database. This case has
         // its own sentence so that it can be told from the case above.
@@ -471,14 +518,14 @@ fn edits_block(
             let line = match on_server.current() {
                 true => format!(
                     "Applied — all {n} row(s) are in the database. Restart the server to \
-                     see them; Put back undoes it."
+                     see them; Restore reverts them."
                 ),
                 // The signature is per process, so a project also reads this
                 // way after a relaunch. See `EditSession::applied_creatures`.
                 false => format!(
-                    "Applied — all {n} row(s) are in the database, though not \
-                     necessarily at the values shown: something has been edited since, \
-                     or this is a later session. Apply again to be sure."
+                    "Applied — all {n} row(s) are in the database, possibly with older \
+                     values: an edit was made since, or this is a later session. Apply \
+                     again to make sure."
                 ),
             };
             ui.label(egui::RichText::new(line).small().color(theme::INK_DIM));
@@ -495,7 +542,7 @@ fn edits_block(
         (n, _, true) => {
             ui.label(
                 egui::RichText::new(format!(
-                    "{n} row(s) applied and undoable, and this project now changes none of them"
+                    "{n} row(s) applied and undoable; the project no longer changes any of them"
                 ))
                 .small()
                 .color(theme::WARN),
@@ -505,8 +552,8 @@ fn edits_block(
     if ui
         .button("Server\u{2026}")
         .on_hover_text(format!(
-            "Apply these rows, put them back, or give them up — every server operation is \
-             on one panel, with the spells and the items. {REVERT} is what puts them back.",
+            "Open the Server panel, which holds Apply, Restore and Discard for every \
+             subject, including spells and items. Restore runs {REVERT}.",
         ))
         .clicked()
     {
@@ -514,8 +561,8 @@ fn edits_block(
     }
     theme::note(
         ui,
-        "Applying writes the rows and nothing else — the server reads its creatures once, \
-         at startup, so restart it to see them.",
+        "Apply writes the rows only. The server reads creatures once, at startup, so \
+         restart it to see them.",
     );
     ui.separator();
 }
@@ -583,10 +630,10 @@ fn picker(ui: &mut egui::Ui, subject: &mut Subject<'_>) {
             }
             theme::note(
                 ui,
-                "Click the ground to place it. Escape puts it down; every column of \
-                 the row can be edited afterwards in Select.",
+                "Click the ground to place it. Escape clears the chosen creature. Every \
+                 column of the row can be edited afterwards in Select.",
             );
-            theme::note(ui, ", and . turn it \u{b7} shift is three times \u{b7} alt + mouse turns it");
+            theme::note(ui, ", and . turn it \u{b7} shift turns three times as far \u{b7} alt + mouse turns it");
             theme::note(ui, "ctrl with alt snaps the turn to 15\u{b0}");
             // The window's toggle, here as well as under a selected spawn, so
             // a creature can be edited before any spawn of it exists.
@@ -594,7 +641,7 @@ fn picker(ui: &mut egui::Ui, subject: &mut Subject<'_>) {
             if ui
                 .selectable_label(open, "Edit creature…")
                 .on_hover_text(
-                    "Open creature_template's 78 columns in a window of their own. The \
+                    "Open creature_template's 78 columns in a separate window. The \
                      window follows the chosen creature.",
                 )
                 .clicked()
@@ -613,8 +660,8 @@ fn picker(ui: &mut egui::Ui, subject: &mut Subject<'_>) {
         }
         None => theme::note(
             ui,
-            "No creature chosen. Find one below by name or entry; the next click on the \
-             ground puts it there.",
+            "No creature chosen. Search below by name or entry, then click the ground \
+             to place it.",
         ),
     }
 
@@ -638,13 +685,13 @@ fn picker(ui: &mut egui::Ui, subject: &mut Subject<'_>) {
         return;
     }
     if subject.creatures.new_spawn.search.trim().len() < 2 {
-        theme::note(ui, "Type two letters of a name, or an entry.");
+        theme::note(ui, "Type at least two letters of a name, or an entry.");
         return;
     }
     let matches = subject.creatures.new_spawn.matches.clone();
     if matches.is_empty() {
         ui.label(
-            egui::RichText::new("no creature of that name")
+            egui::RichText::new("no matching creature")
                 .small()
                 .color(theme::INK_DIM),
         );
@@ -692,10 +739,10 @@ fn template_actions(ui: &mut egui::Ui, subject: &mut Subject<'_>) {
         if ui
             .add(egui::Button::new("+ New").min_size(size))
             .on_hover_text(
-                "A new creature_template row, numbered above anything upstream will \
-                 reach. It starts as a level 1 friendly humanoid with no model: a row \
-                 the server loads, drawn as a box until display_id1 is chosen. The \
-                 window opens on it.",
+                "Create a creature_template row with an entry above any upstream entry. \
+                 It starts as a level 1 friendly humanoid with no model: the server loads \
+                 it, and the editor draws it as a box until display_id1 is set. The \
+                 template window opens on it.",
             )
             .clicked()
         {
@@ -707,9 +754,9 @@ fn template_actions(ui: &mut egui::Ui, subject: &mut Subject<'_>) {
         if ui
             .add_enabled(row_read, egui::Button::new("Copy").min_size(size))
             .on_hover_text(
-                "A copy of the chosen creature under a new entry, with every column as \
-                 it is shown: the database's value where this project has not changed \
-                 it and the project's where it has.",
+                "Copy the chosen creature to a new entry with every column as shown: \
+                 the database value where this project has not changed it, and the \
+                 project's value where it has.",
             )
             .on_disabled_hover_text("Choose a creature first.")
             .clicked()
@@ -728,8 +775,8 @@ fn template_actions(ui: &mut egui::Ui, subject: &mut Subject<'_>) {
         if ui
             .add_enabled(created, egui::Button::new("Discard").min_size(size))
             .on_hover_text(
-                "Give up the template this project was going to create. Nothing in the \
-                 database is touched. A template the database holds cannot be removed: \
+                "Remove the template this project creates. Nothing in the database \
+                 changes. A template already in the database cannot be removed: \
                  .reload creature_template never drops an entry it has read.",
             )
             .on_disabled_hover_text("Only a creature this project created can be discarded.")
@@ -755,7 +802,7 @@ fn created_templates(ui: &mut egui::Ui, subject: &mut Subject<'_>) {
     ui.add_space(6.0);
     ui.label(
         egui::RichText::new(format!(
-            "{} creature(s) this project creates",
+            "{} creature(s) created by this project",
             templates.len()
         ))
         .small()
@@ -861,7 +908,7 @@ fn claim(
                 false => "New — this project creates it. There is no row in the database yet."
                     .to_string(),
                 true => "New — created by this project and applied. The database holds the \
-                         row; the server has to be restarted to see it in the world."
+                         row; restart the server to see the spawn in the world."
                     .to_string(),
             })
             .small()
@@ -874,8 +921,8 @@ fn claim(
                 false => "Marked for removal. Applying deletes the row, and with it the \
                           spawn's waypoints, its addon and its game-event rows."
                     .to_string(),
-                true => "Removed, and applied. The row and its five dependent tables are \
-                         gone from the database; Put back restores all six."
+                true => "Removed and applied. The row and its rows in five dependent tables \
+                         are deleted from the database; Restore reverts all of them."
                     .to_string(),
             })
             .small()
@@ -886,15 +933,15 @@ fn claim(
         match spawn.is_removed() {
             true => {
                 if ui
-                    .button("Keep it")
+                    .button("Cancel removal")
                     .on_hover_text(
-                        "Take the removal back. Any columns this project had changed on it \
-                         are still changed.",
+                        "Cancel the removal. Column edits this project made to the spawn \
+                         remain.",
                     )
                     .clicked()
                 {
                     crate::tools::creatures::Creatures::keep(subject.session, spawn.guid, now);
-                    subject.session.status = format!("spawn {} is kept", spawn.guid);
+                    subject.session.status = format!("spawn {} removal cancelled", spawn.guid);
                 }
             }
             false => {
@@ -910,18 +957,18 @@ fn claim(
                     .button(egui::RichText::new(word).color(theme::BAD))
                     .on_hover_text(match (spawn.is_new(), written) {
                         (true, true) => {
-                            "Give up this project's claim on the spawn. The row \
-                                         is already in the database and stays there — Put \
-                                         the rows back is what removes it."
+                            "Remove the spawn from this project. The row is \
+                                         already in the database and stays there; \
+                                         Restore on the Server panel removes it."
                         }
                         (true, false) => {
-                            "Give up the spawn this project was going to create. \
-                                 Nothing in the database is touched."
+                            "Remove the spawn this project creates. Nothing in \
+                                 the database changes."
                         }
                         (false, _) => {
-                            "Mark the row for deletion. Nothing happens until \
-                                  Apply, and then the server has to be restarted — .reload \
-                                  creature never erases a spawn it has already read."
+                            "Mark the row for deletion. Apply deletes it; then \
+                                  restart the server, because .reload creature never \
+                                  removes a spawn it has already read."
                         }
                     })
                     .clicked()
@@ -978,7 +1025,7 @@ fn head(ui: &mut egui::Ui, subject: &mut Subject<'_>, spawn: &Spawn) {
     ui.horizontal(|ui| {
         if ui
             .small_button("Go to")
-            .on_hover_text("Put the camera on it.")
+            .on_hover_text("Move the camera to this spawn.")
             .clicked()
         {
             let at = spawn.at;
@@ -997,8 +1044,8 @@ fn head(ui: &mut egui::Ui, subject: &mut Subject<'_>, spawn: &Spawn) {
         if ui
             .add_enabled(has_row, egui::Button::new("Duplicate"))
             .on_hover_text(
-                "Another spawn of this creature two yards north, carrying every column \
-                 this one has — including the ones this project has changed.",
+                "Create a spawn of this creature two yards north with every column of \
+                 this one, including the columns this project has changed.",
             )
             .on_disabled_hover_text("Still reading this spawn's row.")
             .clicked()
@@ -1016,7 +1063,7 @@ fn head(ui: &mut egui::Ui, subject: &mut Subject<'_>, spawn: &Spawn) {
             .filter(|other| other.entry == spawn.entry)
             .count();
         ui.label(
-            egui::RichText::new(format!("{others} of this creature on this map"))
+            egui::RichText::new(format!("{others} spawn(s) of this creature on this map"))
                 .small()
                 .color(theme::INK_FAINT),
         );
@@ -1028,9 +1075,8 @@ fn spawn_form(ui: &mut egui::Ui, subject: &mut Subject<'_>, spawn: &Spawn) {
     theme::heading(ui, "This spawn");
     theme::note(
         ui,
-        "One creature, at one place. Click it in the viewport to open it, then drag the \
-         one that is open to move it — the position columns are what a drag writes, as \
-         one undo step.",
+        "The creature row: one spawn at one position. Drag the selected spawn in the \
+         viewport to move it; a drag writes the position columns as one undo step.",
     );
     let key = spawn.key();
     let Some(row) = subject
@@ -1135,26 +1181,16 @@ fn summary(ui: &mut egui::Ui, subject: &mut Subject<'_>, spawn: &Spawn, edited: 
         }),
     );
     ui.label(
-        egui::RichText::new("Every one of these in the world, on every map.")
+        egui::RichText::new("Edits here change every spawn of this entry, on every map.")
             .small()
             .color(theme::INK_FAINT),
     );
 
     // The few columns worth reading at a glance, from the row the map query
     // already carries, so this shows something before the whole row has been
-    // fetched. The model beside them, from the same display id.
+    // fetched. The model is drawn at the panel's right edge, from the same
+    // display id.
     ui.horizontal(|ui| {
-        let (rect, _) =
-            ui.allocate_exact_size(egui::Vec2::splat(SUMMARY_PICTURE), egui::Sense::hover());
-        match worn(subject, spawn.display_id) {
-            Some(worn) => {
-                let key = subject.portraits.want_worn(&worn);
-                crate::portraits::paint(ui, subject.portraits, &key, rect);
-            }
-            None => {
-                ui.painter().rect_filled(rect, 3.0, theme::DEAD);
-            }
-        }
         egui::Grid::new("creature-summary")
             .num_columns(2)
             .spacing([8.0, 2.0])
@@ -1165,7 +1201,7 @@ fn summary(ui: &mut egui::Ui, subject: &mut Subject<'_>, spawn: &Spawn, edited: 
                     ("faction", spawn.faction.to_string()),
                     ("display", spawn.display_id.to_string()),
                     (
-                        "offers",
+                        "npc flags",
                         creature::mask_words(&creature::NPC_FLAGS, spawn.npc_flags),
                     ),
                 ] {
@@ -1174,6 +1210,19 @@ fn summary(ui: &mut egui::Ui, subject: &mut Subject<'_>, spawn: &Spawn, edited: 
                     ui.end_row();
                 }
             });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+            let (rect, _) =
+                ui.allocate_exact_size(egui::Vec2::splat(SUMMARY_PICTURE), egui::Sense::hover());
+            match worn(subject, spawn.display_id) {
+                Some(worn) => {
+                    let key = subject.portraits.want_worn(&worn);
+                    crate::portraits::paint(ui, subject.portraits, &key, rect);
+                }
+                None => {
+                    ui.painter().rect_filled(rect, 3.0, theme::DEAD);
+                }
+            }
+        });
     });
 }
 
@@ -1187,8 +1236,8 @@ fn windows(ui: &mut egui::Ui, subject: &mut Subject<'_>, spawn: &Spawn) {
         if ui
             .selectable_label(open, "Edit creature…")
             .on_hover_text(
-                "Open creature_template's 78 columns in a window of their own. It can be \
-                 dragged off the panel and left open while the pointer works in the world.",
+                "Open creature_template's 78 columns in a separate window. The window can \
+                 be moved off the panel and stay open while you work in the viewport.",
             )
             .clicked()
         {
@@ -1204,9 +1253,9 @@ fn windows(ui: &mut egui::Ui, subject: &mut Subject<'_>, spawn: &Spawn) {
         if ui
             .selectable_label(showing, "Waypoints")
             .on_hover_text(
-                "The path this creature walks, out of creature_movement: drawn on the ground, \
-                 its points picked, dragged, added and removed. It follows the selection, so \
-                 clicking another creature shows that creature's path.",
+                "The creature's waypoint path from creature_movement, drawn on the ground. \
+                 Points can be selected, dragged, added and removed. The window follows the \
+                 selection and shows the path of the selected creature.",
             )
             .clicked()
         {
@@ -1234,10 +1283,10 @@ fn windows(ui: &mut egui::Ui, subject: &mut Subject<'_>, spawn: &Spawn) {
         if ui
             .selectable_label(quests_open, "Quests")
             .on_hover_text(
-                "What it gives and what it takes: creature_questrelation and \
-                 creature_involvedrelation, listed, added to and removed from. Each quest \
-                 opens in the quest workspace. The rows name this creature_template entry, \
-                 so they are about every spawn of it.",
+                "Quests this creature starts and ends: creature_questrelation and \
+                 creature_involvedrelation rows, which can be added and removed. Each quest \
+                 opens in the quest workspace. The rows reference the creature_template \
+                 entry, so they apply to every spawn of it.",
             )
             .clicked()
         {
@@ -1256,10 +1305,10 @@ fn windows(ui: &mut egui::Ui, subject: &mut Subject<'_>, spawn: &Spawn) {
         if ui
             .selectable_label(subject.loot.open, "Loot")
             .on_hover_text(
-                "What it drops, what is pickpocketed from it and what it is skinned for: \
-                 creature_loot_template, pickpocketing_loot_template and \
-                 skinning_loot_template, by the three loot ids on its template. The rows \
-                 name a loot id, so they are about every creature that shares it.",
+                "The creature's drop, pickpocket and skinning loot: creature_loot_template, \
+                 pickpocketing_loot_template and skinning_loot_template, by the three loot \
+                 ids on its template. The rows are keyed by loot id, so they apply to every \
+                 creature that shares it.",
             )
             .clicked()
         {
@@ -1270,10 +1319,10 @@ fn windows(ui: &mut egui::Ui, subject: &mut Subject<'_>, spawn: &Spawn) {
         if ui
             .selectable_label(subject.behaviour.events_open, "Events")
             .on_hover_text(
-                "What it reacts to, out of creature_ai_events: each trigger with its \
-                 parameters named, and the creature_ai_scripts each runs, opened into the \
-                 script window. Read only by a template whose ai_name is EventAI, which the \
-                 window offers to set.",
+                "The creature's creature_ai_events: each trigger with its parameters, and \
+                 the creature_ai_scripts it runs, opened in the script window. The server \
+                 reads them only for a template whose ai_name is EventAI; the window can \
+                 set it.",
             )
             .clicked()
         {
@@ -1282,13 +1331,28 @@ fn windows(ui: &mut egui::Ui, subject: &mut Subject<'_>, spawn: &Spawn) {
         if ui
             .selectable_label(subject.behaviour.spells_open, "Spells")
             .on_hover_text(
-                "What it casts in combat, out of creature_spells by the template's \
-                 spell_list_id: eight slots, each a spell, its chance, its target, its \
-                 flags and its timers.",
+                "The creature's combat spells from creature_spells, by the template's \
+                 spell_list_id: eight slots, each with a spell, chance, target, flags and \
+                 timers.",
             )
             .clicked()
         {
             subject.behaviour.spells_open = !subject.behaviour.spells_open;
+        }
+        // Gossip is a window over the world that follows the selection, like
+        // the ones beside it. See `super::gossip`.
+        if ui
+            .selectable_label(subject.gossip.open, "Gossip")
+            .on_hover_text(
+                "The gossip_menu named by the template's gossip_menu_id: its texts, its \
+                 options and the menus they open. The window can create a menu for a \
+                 creature that has none.",
+            )
+            .clicked()
+        {
+            subject.gossip.open = !subject.gossip.open;
+            subject.gossip.menu = None;
+            subject.gossip.trail.clear();
         }
         // Vendor and Trainer are two windows over the world that follow the
         // selection, like the four beside them. See `super::services`.
@@ -1296,9 +1360,9 @@ fn windows(ui: &mut egui::Ui, subject: &mut Subject<'_>, spawn: &Spawn) {
         if ui
             .selectable_label(subject.services.is_open(Kind::Vendor), "Vendor")
             .on_hover_text(
-                "What it sells: npc_vendor under its entry, and npc_vendor_template under its \
-                 vendor_id, which other creatures may share. Each item with its place in the \
-                 list, its stock and its restock time.",
+                "The creature's vendor items: npc_vendor by its entry, and npc_vendor_template \
+                 by its vendor_id, which other creatures can share. Each item with its slot, \
+                 stock and restock time.",
             )
             .clicked()
         {
@@ -1307,9 +1371,9 @@ fn windows(ui: &mut egui::Ui, subject: &mut Subject<'_>, spawn: &Spawn) {
         if ui
             .selectable_label(subject.services.is_open(Kind::Trainer), "Trainer")
             .on_hover_text(
-                "What it teaches: npc_trainer under its entry, and npc_trainer_template under its \
-                 trainer_id, which other creatures may share. Each teaching spell with the level, \
-                 the price and the skill it needs.",
+                "The creature's trainer spells: npc_trainer by its entry, and npc_trainer_template \
+                 by its trainer_id, which other creatures can share. Each teaching spell with its \
+                 required level, cost and required skill.",
             )
             .clicked()
         {
@@ -1328,8 +1392,8 @@ const SUMMARY_PICTURE: f32 = 56.0;
 /// window so that it can be larger than the panel and placed elsewhere on the
 /// screen.
 ///
-/// The title names the creature and entry, not only the body: two creatures'
-/// windows hold numbers that look alike, and the entry is what tells them
+/// The title names the creature and its entry, as the body does: two
+/// creatures' windows hold numbers that look alike, and the entry tells them
 /// apart.
 pub fn template_window(ctx: &egui::Context, subject: &mut Subject<'_>) -> Option<egui::Rect> {
     if !subject.creatures.template_window {
@@ -1412,8 +1476,8 @@ fn template_head(
         Life::Insert => {
             ui.label(
                 egui::RichText::new(
-                    "New: this row is in no database yet. Apply writes it, and the server \
-                     has to be restarted for a spawn of it to stand.",
+                    "New: this row is not in the database yet. Apply writes it; restart the \
+                     server before spawns of it appear in the world.",
                 )
                 .small()
                 .color(theme::ACCENT),
@@ -1422,7 +1486,7 @@ fn template_head(
         _ => {
             ui.label(
                 egui::RichText::new(format!(
-                    "Every one of these in the world, on every map — {} on this one",
+                    "Edits here change every spawn of this entry, on every map — {} on this map",
                     subject
                         .creatures
                         .spawns
@@ -1441,7 +1505,7 @@ fn template_head(
             false => theme::INK_DIM,
         };
         ui.label(egui::RichText::new("entry").color(colour))
-            .on_hover_text("the creature id");
+            .on_hover_text("The creature_template entry. Changing it renumbers the row.");
         let id = ui.make_persistent_id(("creature-template-entry", shown.patch));
         entry_field(ui, subject, shown, id);
     });
@@ -1453,8 +1517,8 @@ fn template_head(
 /// a key that moved on every digit typed would re-key the row four times on
 /// the way to `20000`, and three of those are entries somebody else may own.
 ///
-/// What it does is one thing whatever the row is: the project's claim on the
-/// row is re-keyed, so the template is one row before and after; see
+/// It does the same for any row: the project's claim on the row is re-keyed,
+/// so the template is one row before and after; see
 /// [`crate::tools::creatures::Creatures::rekey_template`]. For a row the
 /// database holds, the apply then moves the row and every column of the world
 /// database that names a creature by entry.
@@ -1476,7 +1540,7 @@ fn entry_field(
     let trouble_id = id.with("trouble");
     if let Some(text) = finished(ui, id, &response, text) {
         let trouble = match text.trim().parse::<u32>() {
-            Err(_) => Some(format!("{text:?} is not an entry")),
+            Err(_) => Some(format!("{text:?} is not a valid entry number")),
             Ok(wanted) => {
                 let now = subject.now;
                 match subject
@@ -1505,23 +1569,23 @@ fn entry_field(
         (true, _) => ("renumbers this new creature".to_string(), theme::INK_FAINT),
         (_, true) => (
             format!(
-                "the database has it at {} until this is applied",
+                "the database holds it at entry {} until this is applied",
                 shown.read_entry
             ),
             theme::WARN,
         ),
         _ => (
-            "moves the row, and what names it in the world database follows".to_string(),
+            "renumbers the row and every world database reference to it".to_string(),
             theme::INK_FAINT,
         ),
     };
     ui.label(egui::RichText::new(word).small().color(colour))
         .on_hover_text(format!(
-            "vmangos has no foreign keys, so the apply writes the cascade itself: the \
-             row, and the {} columns of the world database that name a creature by \
+            "vmangos has no foreign keys, so Apply updates the references itself: the \
+             row, and the {} world database columns that reference a creature by \
              entry: every spawn's id, the quest relations, npc_vendor, npc_trainer, \
-             the AI events, the loot and movement templates. Put back returns all of \
-             it.\n\nNot reached: a script's datalong, the conditions table, and the \
+             the AI events, the loot and movement templates. Restore reverts all of \
+             it.\n\nNot updated: a script's datalong, the conditions table, and the \
              C++ scripts, which name entries as constants.",
             vale_mangos::creature::TEMPLATE_REFERENCES.len()
         ));
@@ -1577,7 +1641,7 @@ fn groups(
     ui.add_space(12.0);
 }
 
-/// One column on a row of its own: its name, the control its kind asks for,
+/// One column on a row of its own: its name, the control its [`Kind`] asks for,
 /// what the value means, and the revert arrow when this project has changed
 /// it.
 fn field(
@@ -1650,6 +1714,21 @@ fn field(
                 written
             }
         };
+        // A gossip menu can be opened from here, and a new one made and named.
+        if table == creature::TEMPLATE && column.name == "gossip_menu_id" {
+            let npc_flags = subject
+                .session
+                .server_edits
+                .get(table, key, "npc_flags")
+                .map(str::to_string)
+                .or_else(|| creature::column(table, "npc_flags").and_then(|flags| flags.literal(row)))
+                .and_then(|flags| flags.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            let menu = showing.trim().parse().unwrap_or(0);
+            use vale_mangos::schema::RowValue;
+            let label = format!("{} ({})", row.text("name").unwrap_or("creature"), row.integer("entry").unwrap_or(0));
+            super::gossip::menu_buttons(ui, subject.session, subject.gossip, key, menu, npc_flags, &label);
+        }
         if let Some(written) = written {
             target(table, key, column, &in_database, creating).write(
                 subject.session,
@@ -1715,8 +1794,8 @@ fn target(
 /// A display id: the number, a picture of the model it names, the button
 /// that opens the picker, and the model's path.
 ///
-/// The number stays editable beside the picture, because an id read off a
-/// wiki is a thing people have in hand. The picture is the same rendered
+/// The number stays editable beside the picture, because a user often has the
+/// id already, for example from a wiki. The picture is the same rendered
 /// portrait the Place picker's rows draw.
 fn display_cell(
     ui: &mut egui::Ui,
@@ -1741,8 +1820,8 @@ fn display_cell(
     if ui
         .small_button("choose\u{2026}")
         .on_hover_text(
-            "Every row of CreatureDisplayInfo.dbc that resolves to a model, as pictures, \
-             searched by the model's path or a skin's name.",
+            "Choose a CreatureDisplayInfo.dbc row from model previews. Search by model \
+             path or skin name. Only rows that resolve to a model are listed.",
         )
         .clicked()
     {
@@ -1752,7 +1831,7 @@ fn display_cell(
         Some(worn) => meaning_truncated(ui, worn.path),
         None if id != 0 => {
             ui.label(
-                egui::RichText::new("no such display row")
+                egui::RichText::new("not in CreatureDisplayInfo.dbc")
                     .small()
                     .color(theme::BAD),
             );

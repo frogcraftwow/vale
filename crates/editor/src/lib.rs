@@ -2,6 +2,8 @@
 //!
 //! ```text
 //! camera.rs    the free camera, which the client does not have
+//! context.rs   the right-click menu over the viewport: when a click opens
+//!              one and what it is about
 //! pick.rs      what the camera points at: the edited ground, and the
 //!              buildings and scenery standing on it
 //! places.rs    the zones of a map and the middle of each one, for the
@@ -29,8 +31,10 @@
 //! navmesh.rs   the server's navmesh drawn over the ground: the mmaps tiles
 //!              around the camera, coloured by what a path query makes of
 //!              each polygon
+//! marks.rs     what the tools draw in the world: handles, domes, dashed
+//!              rings, volumes, as meshes the ground can hide
 //! tools/       what the pointer does when a button is held, one file per tool
-//! ui/          the panels: the shell, the look, and one file per region of it
+//! ui/          the panels: the shell, the theme, and one file per region of it
 //! server/      what is sent to the server a playtest runs against; the one
 //!              destination of an edit that is not a file
 //! ```
@@ -79,9 +83,11 @@
 
 pub mod bookmarks;
 pub mod camera;
+pub mod context;
 pub mod favourites;
 pub mod jobs;
 pub mod lab;
+pub mod marks;
 pub mod navmesh;
 pub mod pick;
 pub mod places;
@@ -170,8 +176,20 @@ pub fn run() {
     if args.show_map {
         app.insert_resource(ui::mapview::MapView::opened());
     }
+    if args.new_map {
+        app.insert_resource(tools::tiles::Tiles {
+            new_map: Some(tools::maps::Form {
+                choosing_screen: true,
+                ..tools::maps::Form::default()
+            }),
+            ..tools::tiles::Tiles::default()
+        });
+    }
     if args.navmesh {
         app.insert_resource(navmesh::Navmesh::shown());
+    }
+    if args.map_view {
+        app.insert_resource(camera::TopDown::shown());
     }
     // Inserted before `EditorPlugins` and before the client's own
     // `init_resource`, which keeps a value that is already present. See
@@ -221,12 +239,14 @@ impl Plugin for EditorPlugins {
             shot::ShotPlugin,
             tour::TourPlugin,
             camera::CameraPlugin,
+            context::ContextMenuPlugin,
             pick::PickPlugin,
             tools::ToolPlugin,
             stage::StagePlugin,
             lab::LabPlugin,
             portraits::PortraitPlugin,
             navmesh::NavmeshPlugin,
+            marks::MarksPlugin,
             ui::PanelPlugin,
         ));
         app.init_resource::<favourites::Favourites>()
@@ -308,7 +328,7 @@ pub struct Args {
     /// the same split as the client's own `--view`. It exists for the same
     /// reason as `--row` and `--browse`: the camera opens 60 yards out and a
     /// scripted run has no mouse wheel, so without this flag a scripted picture
-    /// cannot show anything further away than a hillside. That includes the
+    /// cannot show distant ground. That includes the
     /// streamed block itself, which is 3,733 yards across and cannot be seen
     /// from 60.
     pub view: Option<(f32, Option<f32>, Option<f32>)>,
@@ -434,9 +454,15 @@ pub struct Args {
     /// it is the one part of the chrome `--shot` cannot photograph, and its
     /// layout goes unchecked. See [`shot`].
     pub show_map: bool,
+    /// `--new-map`: the map window with its New map form open on the loading
+    /// screen pictures, for the same reason as `--tiles`.
+    pub new_map: bool,
     /// `--navmesh`: start with the server's navmesh drawn over the ground,
     /// which is otherwise the view bar's NAV button. See [`navmesh`].
     pub navmesh: bool,
+    /// `--map-view`: start in the top-down map view, which is otherwise the
+    /// view bar's MAP button. See [`camera::TopDown`].
+    pub map_view: bool,
     /// `--character <name>`: who a playtest logs in as.
     ///
     /// A default for [`playtest::Login`]'s field rather than a setting of its
@@ -565,6 +591,10 @@ pub struct Args {
     /// `--spawn`.
     pub vendor_window: bool,
     pub trainer_window: bool,
+    /// `--gossip`: open the gossip window on `--spawn`'s creature.
+    pub gossip_window: bool,
+    /// `--condition <id>`: open the condition window on one condition.
+    pub condition: Option<u32>,
     /// `--vendor-add <item>` and `--trainer-add <spell>`: add a row to the
     /// list the window shows, which a scripted run cannot do otherwise. A
     /// spell that is not a teaching spell is replaced by the one that teaches
@@ -762,9 +792,9 @@ pub struct Args {
     /// segmented control, the search is typing, and the choice is a click on a
     /// row.
     ///
-    /// It cannot show the ghost, and no flag can: the model on the cursor
-    /// stands where the pointer meets the ground, and a scripted run has no
-    /// pointer. The placement tools' own preview has the same limitation.
+    /// It cannot show the translucent preview, and no flag can: the model on
+    /// the cursor stands where the pointer meets the ground, and a scripted run
+    /// has no pointer. The placement tools' own preview has the same limitation.
     pub pick: Option<u32>,
     /// `--bits <column>`: open the mask dialog on that column of `--row`.
     ///
@@ -797,12 +827,16 @@ pub struct Args {
     ///
     /// A scripted run cannot make this selection otherwise: the rectangle is a
     /// drag, and a script has no pointer. It is released seven seconds before
-    /// `--after`'s shutter, so the picture shows the group and the frame
-    /// sample, which covers the last five seconds, is taken with it selected.
+    /// the `--after` picture is taken, so the picture shows the group and the
+    /// frame sample, which covers the last five seconds, is taken with it
+    /// selected.
     pub enclose: Option<[f32; 4]>,
     /// `--taxi-node <id>`: the flight path tool, open on one node, with the
     /// camera over it.
     pub taxi_node: Option<u32>,
+    /// `--trigger <id>`: the area trigger tool, open on one trigger of the
+    /// open map, with the camera over it.
+    pub trigger: Option<u32>,
     /// `--taxi-path <id>`: the flight path tool, open on one path, with the
     /// camera over its middle.
     pub taxi_path: Option<u32>,
@@ -813,6 +847,10 @@ pub struct Args {
     /// `--taxi-node-add <x>,<y>`: a new node on the ground at that place, once
     /// its tile is open.
     pub taxi_node_add: Option<(f32, f32)>,
+    /// `--flight-map`: Make a flight map (or Fit the flight map) on the open
+    /// map, once its nodes are read: the `WorldMapContinent.dbc` row and the
+    /// picture.
+    pub flight_map: bool,
 }
 
 impl Default for Args {
@@ -855,9 +893,11 @@ impl Default for Args {
             set: None,
             enclose: None,
             taxi_node: None,
+            trigger: None,
             taxi_path: None,
             taxi_connect: None,
             taxi_node_add: None,
+            flight_map: false,
             spawn: None,
             waypoints: false,
             waypoint_add: None,
@@ -875,6 +915,8 @@ impl Default for Args {
             apply_loot: false,
             revert_loot: false,
             vendor_window: false,
+            gossip_window: false,
+            condition: None,
             trainer_window: false,
             vendor_add: None,
             trainer_add: None,
@@ -918,7 +960,9 @@ impl Default for Args {
             projects: false,
             doom: None,
             show_map: false,
+            new_map: false,
             navmesh: false,
+            map_view: false,
             shot: None,
             after: None,
             tour: None,
@@ -1047,7 +1091,12 @@ impl Args {
                     parsed.projects = true;
                 }
                 "--tiles" => parsed.show_map = true,
+                "--new-map" => {
+                    parsed.show_map = true;
+                    parsed.new_map = true;
+                }
                 "--navmesh" => parsed.navmesh = true,
+                "--map-view" => parsed.map_view = true,
                 "--enclose" => {
                     parsed.enclose = args.next().as_deref().and_then(parse_rect);
                 }
@@ -1075,6 +1124,10 @@ impl Args {
                     parsed.stitch = true;
                     parsed.tool = Some(tools::Tool::Chunks);
                 }
+                "--trigger" => {
+                    parsed.trigger = args.next().as_deref().and_then(|v| v.trim().parse().ok());
+                    parsed.tool = Some(tools::Tool::Triggers);
+                }
                 "--taxi-node" => {
                     parsed.taxi_node = args.next().as_deref().and_then(|v| v.trim().parse().ok());
                     parsed.tool = Some(tools::Tool::Flightpaths);
@@ -1092,6 +1145,10 @@ impl Args {
                 }
                 "--taxi-node-add" => {
                     parsed.taxi_node_add = args.next().as_deref().and_then(parse_pair);
+                    parsed.tool = Some(tools::Tool::Flightpaths);
+                }
+                "--flight-map" => {
+                    parsed.flight_map = true;
                     parsed.tool = Some(tools::Tool::Flightpaths);
                 }
                 "--tour" => {
@@ -1141,6 +1198,8 @@ impl Args {
                 "--apply-loot" => parsed.apply_loot = true,
                 "--revert-loot" => parsed.revert_loot = true,
                 "--vendor" => parsed.vendor_window = true,
+                "--gossip" => parsed.gossip_window = true,
+                "--condition" => parsed.condition = args.next().as_deref().and_then(|v| v.trim().parse().ok()),
                 "--trainer" => parsed.trainer_window = true,
                 "--vendor-add" => {
                     parsed.vendor_add = args.next().as_deref().and_then(|v| v.trim().parse().ok());
@@ -1437,6 +1496,8 @@ mod tests {
         let parse = |list: &[&str]| Args::parse(list.iter().map(|s| s.to_string()));
         let args = parse(&["--taxi-node", "2"]);
         assert_eq!((args.taxi_node, args.tool), (Some(2), Some(tools::Tool::Flightpaths)));
+        let args = parse(&["--trigger", "78"]);
+        assert_eq!((args.trigger, args.tool), (Some(78), Some(tools::Tool::Triggers)));
         assert_eq!(parse(&["--taxi-path", "41"]).taxi_path, Some(41));
         assert_eq!(parse(&["--taxi-connect", "2, 5"]).taxi_connect, Some((2, 5)));
         assert_eq!(parse(&["--taxi-connect", "2"]).taxi_connect, None);
@@ -1562,8 +1623,8 @@ mod tests {
         );
     }
 
-    /// `--character` names who a playtest is, and is absent by default so the
-    /// folder's own answer is what a run with no flag uses.
+    /// `--character` names the character a playtest logs in as, and is absent
+    /// by default so the folder's own answer is what a run with no flag uses.
     #[test]
     fn a_character_can_be_named_on_the_command_line() {
         let args = Args::parse(["--character", "Alden"].into_iter().map(String::from));

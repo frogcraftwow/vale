@@ -65,6 +65,10 @@ pub struct ActiveSession {
     /// and a handshake names its realm because `GetServerName()` returns it.
     /// Nothing in the world reads it.
     pub realm: String,
+    /// The realm's type from the realm list, carried the same way. The world
+    /// does read this one: `GetZonePVPInfo` answers differently on a PvP
+    /// realm. See [`vale_assets::tables::territory`].
+    pub realm_type: u32,
     /// Which account this character belongs to. The world does read this: the
     /// key bindings live under `WTF\Account\<account>\`, and the two files there
     /// are keyed by this and by [`Self::realm`]. See [`Handshake::account`] for
@@ -169,6 +173,8 @@ pub struct Handshake {
     pub characters: Vec<world::CharListEntry>,
     /// Which realm's world server this is, for the screen to say so.
     pub realm: String,
+    /// That realm's type; see [`ActiveSession::realm_type`].
+    pub realm_type: u32,
     /// The account that logged in: the one the SRP6 exchange used. It is
     /// carried for the same reason as [`ActiveSession::realm`]: nothing else in
     /// the client can reconstruct it for this session.
@@ -588,6 +594,7 @@ fn re_enumerate_blocking(
     realm: String,
     account: String,
 ) -> Result<Handshake, LoginFailure> {
+    let realm_type = active.realm_type;
     let Some(mut socket) = active.live.reclaim() else {
         return Err(LoginFailure::local(
             "DISCONNECTED",
@@ -607,6 +614,7 @@ fn re_enumerate_blocking(
         session: socket,
         characters,
         realm,
+        realm_type,
         account,
         pinged: std::time::Instant::now(),
     })
@@ -1931,6 +1939,9 @@ impl Plugin for SessionPlugin {
                 Update,
                 (
                     finish_login,
+                    // Before the poll, so a frame never reconciles a world
+                    // whose session has already ended.
+                    end_a_lost_session,
                     keep_selection_alive,
                     poll_world,
                     // After the poll and before the input. The base is the
@@ -2094,6 +2105,7 @@ fn logon_blocking(credentials: Credentials) -> Result<Handshake, LoginFailure> {
         session,
         characters,
         realm: realm.name.clone(),
+        realm_type: realm.kind,
         account: credentials.account.clone(),
         pinged: std::time::Instant::now(),
     })
@@ -2169,6 +2181,7 @@ pub fn start_entering(
     // [`Handshake`], and a handshake names its realm. Nothing else in the world
     // uses it, which is why it travels here rather than in a resource.
     let realm = handshake.realm;
+    let realm_type = handshake.realm_type;
     // The account that logged in, carried the same way for a second reason:
     // the two key-binding files live under `WTF\Account\<account>\`. See
     // [`Handshake::account`] for why `Config.wtf` cannot supply it.
@@ -2180,7 +2193,7 @@ pub fn start_entering(
     let keep_caches = caches.0;
     session.entering = Some(AsyncComputeTaskPool::get().spawn(async move {
         enter_world_blocking(
-            socket, chosen, realm, account, gamedata_dir, overlay, solids, keep_caches,
+            socket, chosen, realm, realm_type, account, gamedata_dir, overlay, solids, keep_caches,
         )
     }));
 }
@@ -2190,6 +2203,7 @@ fn enter_world_blocking(
     session: world::WorldSession,
     chosen: world::CharListEntry,
     realm: String,
+    realm_type: u32,
     account: String,
     gamedata_dir: String,
     overlay: Option<vale_assets::archive::Overlay>,
@@ -2210,7 +2224,7 @@ fn enter_world_blocking(
     let terrain = Arc::new(
         vale_assets::MapTerrain::open_with(
             &gamedata_dir,
-            overlay,
+            overlay.clone(),
             // Its tiles are read on a thread of its own: the session thread
             // and the main thread both ask, and a tile read on either was a
             // stall on both. See `vale_assets::world::terrain`.
@@ -2241,8 +2255,10 @@ fn enter_world_blocking(
     // `vale_protocol::play::areatrigger` for why this is the client's job
     // rather than the server's. Failing to open them is not fatal: the session
     // then behaves as every session did before this existed, and walking into a
-    // portal does nothing.
-    let triggers = match vale_assets::tables::areatrigger::AreaTriggers::open(&gamedata_dir) {
+    // portal does nothing. Read through the host's overlay, as the terrain is:
+    // read from the archives alone, a trigger the host added was never tested,
+    // so walking into it sent nothing.
+    let triggers = match vale_assets::tables::areatrigger::AreaTriggers::open_with(&gamedata_dir, overlay) {
         Ok(table) => Some(Box::new(Portals(table)) as vale_protocol::play::areatrigger::TriggerTable),
         Err(e) => {
             warn!("no area triggers ({e}); instance portals will do nothing");
@@ -2318,6 +2334,7 @@ fn enter_world_blocking(
         map_name,
         map_id,
         realm,
+        realm_type,
         account,
         terrain,
     })
@@ -2387,6 +2404,47 @@ fn finish_login(mut session: ResMut<Session>) {
     } else {
         session.started = None;
     }
+}
+
+/// End a world session whose thread has stopped with an error, and report it
+/// as the 1.12.1 client does: the login screen, with `GlueStrings.lua`'s
+/// `DISCONNECTED` ("Disconnected from server") in a dialog over it.
+///
+/// The session thread stops with an error when the socket fails: the server
+/// closed the connection (a kick, a shutdown, a crash), a read or a write
+/// failed, or a packet could not be handled. `LiveSession` records the reason
+/// in `SessionStatus::error` and the thread exits. Without this system nothing
+/// read that record: `active` stayed set, [`poll_world`] returned early on a
+/// `world_ms` that no longer advanced, and the client showed a frozen world
+/// with no message. A failure during a loading screen also left the screen up,
+/// because the world it waited for never arrived.
+///
+/// A thread that stopped without an error is not handled here. That is a
+/// requested stop, or `SMSG_LOGOUT_COMPLETE`, which
+/// `interface::logout` answers by returning to character select on the same
+/// socket.
+///
+/// Dropping `active` is the same edge a logout makes, so
+/// `interface::leaving` raises `PLAYER_LEAVING_WORLD`, `render::residency`
+/// tears the world down, and `glue::loading` takes down a loading screen.
+/// [`crate::glue::glue`]'s `watch_dialog` shows the dialog from
+/// [`Session::error`].
+fn end_a_lost_session(mut session: ResMut<Session>) {
+    let Some(active) = session.active.as_ref() else {
+        return;
+    };
+    if active.live.is_running() {
+        return;
+    }
+    let Some(reason) = active.live.status().error else {
+        return;
+    };
+    warn!("world session ended: {reason}");
+    session.log_out();
+    session.error = Some(LoginFailure::local(
+        "DISCONNECTED",
+        format!("the world session ended: {reason}"),
+    ));
 }
 
 /// Ping the world socket while the character screen is open.
@@ -3172,8 +3230,10 @@ pub fn send_input(
     active.live.set_controls(controls);
     // The same keys go to the prediction in the same frame. The session thread
     // receives them on its next tick, but the character has to move in this
-    // frame. See `crate::world::predict`.
-    predicted.set_controls(controls);
+    // frame. See `crate::world::predict`. Both halves apply a change from the
+    // moment it was read: the session from the instant the command carries,
+    // the prediction from this frame's render clock.
+    predicted.set_controls(controls, time.elapsed_secs());
 
     // Mouse-look: the character faces wherever the camera looks, from the
     // moment the button goes down. The rig's yaw is the angle to the eye, so
